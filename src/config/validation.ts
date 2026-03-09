@@ -24,6 +24,85 @@ import { OpenClawSchema } from "./zod-schema.js";
 
 const LEGACY_REMOVED_PLUGIN_IDS = new Set(["google-antigravity-auth"]);
 
+type ZodIssueLike = {
+  path?: Array<string | number>;
+  message?: string;
+  errors?: ZodIssueLike[][];
+  unionErrors?: Array<{ issues?: ZodIssueLike[] }>;
+  argumentsError?: { issues?: ZodIssueLike[] };
+  returnTypeError?: { issues?: ZodIssueLike[] };
+};
+
+function applyIssuePathPrefix(
+  issue: ZodIssueLike,
+  prefix: Array<string | number> | undefined,
+): ZodIssueLike {
+  if (!Array.isArray(prefix) || prefix.length === 0) {
+    return issue;
+  }
+  const childPath = Array.isArray(issue.path) ? issue.path : [];
+  if (childPath.length > 0) {
+    return issue;
+  }
+  return {
+    ...issue,
+    path: [...prefix],
+  };
+}
+
+function flattenNestedZodIssues(issue: ZodIssueLike): ZodIssueLike[] {
+  const nested: ZodIssueLike[] = [];
+  const issuePath = Array.isArray(issue.path) ? issue.path : [];
+  if (Array.isArray(issue.errors)) {
+    for (const branch of issue.errors) {
+      if (!Array.isArray(branch)) {
+        continue;
+      }
+      for (const nestedIssue of branch) {
+        nested.push(...flattenNestedZodIssues(applyIssuePathPrefix(nestedIssue, issuePath)));
+      }
+    }
+  }
+  if (Array.isArray(issue.unionErrors)) {
+    for (const unionErr of issue.unionErrors) {
+      if (!Array.isArray(unionErr?.issues)) {
+        continue;
+      }
+      nested.push(
+        ...unionErr.issues.flatMap((entry) =>
+          flattenNestedZodIssues(applyIssuePathPrefix(entry, issuePath)),
+        ),
+      );
+    }
+  }
+  if (Array.isArray(issue.argumentsError?.issues)) {
+    nested.push(...issue.argumentsError.issues.flatMap((entry) => flattenNestedZodIssues(entry)));
+  }
+  if (Array.isArray(issue.returnTypeError?.issues)) {
+    nested.push(...issue.returnTypeError.issues.flatMap((entry) => flattenNestedZodIssues(entry)));
+  }
+  return nested.length > 0 ? nested : [issue];
+}
+
+function mapZodValidationIssues(issues: ZodIssueLike[]): ConfigValidationIssue[] {
+  const expanded = issues.flatMap((issue) => flattenNestedZodIssues(issue));
+  const specific = expanded.filter((issue) => issue.message && issue.message !== "Invalid input");
+  const source = specific.length > 0 ? specific : expanded;
+  const unique = new Map<string, ConfigValidationIssue>();
+
+  for (const issue of source) {
+    const path = Array.isArray(issue.path) ? issue.path.join(".") : "";
+    const message = typeof issue.message === "string" ? issue.message : "Invalid input";
+    const key = `${path}::${message}`;
+    if (unique.has(key)) {
+      continue;
+    }
+    unique.set(key, { path, message });
+  }
+
+  return Array.from(unique.values());
+}
+
 function isWorkspaceAvatarPath(value: string, workspaceDir: string): boolean {
   const workspaceRoot = path.resolve(workspaceDir);
   const resolved = path.resolve(workspaceRoot, value);
@@ -101,10 +180,7 @@ export function validateConfigObjectRaw(
   if (!validated.success) {
     return {
       ok: false,
-      issues: validated.error.issues.map((iss) => ({
-        path: iss.path.join("."),
-        message: iss.message,
-      })),
+      issues: mapZodValidationIssues(validated.error.issues as ZodIssueLike[]),
     };
   }
   const duplicates = findDuplicateAgentDirs(validated.data as OpenClawConfig);
