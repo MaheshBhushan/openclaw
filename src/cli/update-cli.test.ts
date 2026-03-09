@@ -17,6 +17,7 @@ const serviceLoaded = vi.fn();
 const prepareRestartScript = vi.fn();
 const runRestartScript = vi.fn();
 const mockedRunDaemonInstall = vi.fn();
+const mockedRunDaemonStop = vi.fn();
 const serviceReadRuntime = vi.fn();
 const inspectPortUsage = vi.fn();
 const classifyPortListener = vi.fn();
@@ -109,6 +110,7 @@ vi.mock("../commands/doctor.js", () => ({
 vi.mock("./daemon-cli.js", () => ({
   runDaemonInstall: mockedRunDaemonInstall,
   runDaemonRestart: vi.fn(),
+  runDaemonStop: mockedRunDaemonStop,
 }));
 
 // Mock the runtime
@@ -126,7 +128,7 @@ const { readConfigFileSnapshot, writeConfigFile } = await import("../config/conf
 const { checkUpdateStatus, fetchNpmTagVersion, resolveNpmChannelTag } =
   await import("../infra/update-check.js");
 const { runCommandWithTimeout } = await import("../process/exec.js");
-const { runDaemonRestart, runDaemonInstall } = await import("./daemon-cli.js");
+const { runDaemonRestart, runDaemonInstall, runDaemonStop } = await import("./daemon-cli.js");
 const { doctorCommand } = await import("../commands/doctor.js");
 const { defaultRuntime } = await import("../runtime.js");
 const { updateCommand, registerUpdateCli, updateStatusCommand, updateWizardCommand } =
@@ -255,6 +257,7 @@ describe("update-cli", () => {
     vi.mocked(runCommandWithTimeout).mockClear();
     vi.mocked(runDaemonRestart).mockClear();
     vi.mocked(mockedRunDaemonInstall).mockClear();
+    vi.mocked(mockedRunDaemonStop).mockClear();
     vi.mocked(doctorCommand).mockClear();
     vi.mocked(defaultRuntime.log).mockClear();
     vi.mocked(defaultRuntime.error).mockClear();
@@ -534,6 +537,17 @@ describe("update-cli", () => {
     await updateCommand({});
 
     expect(runDaemonRestart).toHaveBeenCalled();
+  });
+
+  it("stops daemon before package updates when service is loaded", async () => {
+    const tempDir = createCaseDir("openclaw-update-package");
+    mockPackageInstallStatus(tempDir);
+    serviceLoaded.mockResolvedValue(true);
+    vi.mocked(runDaemonRestart).mockResolvedValue(true);
+
+    await updateCommand({});
+
+    expect(runDaemonStop).toHaveBeenCalledWith({ json: undefined });
   });
 
   it("updateCommand refreshes gateway service env when service is already installed", async () => {

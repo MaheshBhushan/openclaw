@@ -37,7 +37,7 @@ import { pathExists } from "../../utils.js";
 import { replaceCliName, resolveCliName } from "../cli-name.js";
 import { formatCliCommand } from "../command-format.js";
 import { installCompletion } from "../completion-cli.js";
-import { runDaemonInstall, runDaemonRestart } from "../daemon-cli.js";
+import { runDaemonInstall, runDaemonRestart, runDaemonStop } from "../daemon-cli.js";
 import {
   renderRestartDiagnostics,
   terminateStaleGatewayPids,
@@ -818,15 +818,34 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
 
   let restartScriptPath: string | null = null;
   let refreshGatewayServiceEnv = false;
+  let serviceLoadedBeforeUpdate = false;
   if (shouldRestart) {
     try {
       const loaded = await resolveGatewayService().isLoaded({ env: process.env });
+      serviceLoadedBeforeUpdate = loaded;
       if (loaded) {
         restartScriptPath = await prepareRestartScript(process.env);
         refreshGatewayServiceEnv = true;
       }
     } catch {
       // Ignore errors during pre-check; fallback to standard restart
+    }
+  }
+
+  if (shouldRestart && updateInstallKind === "package" && serviceLoadedBeforeUpdate) {
+    try {
+      if (!opts.json) {
+        defaultRuntime.log(theme.muted("Stopping gateway service before package update..."));
+      }
+      await runDaemonStop({ json: opts.json });
+    } catch (err) {
+      if (!opts.json) {
+        defaultRuntime.log(
+          theme.warn(
+            `Failed to stop gateway service before package update: ${String(err)}. Update may fail if files are locked.`,
+          ),
+        );
+      }
     }
   }
 
