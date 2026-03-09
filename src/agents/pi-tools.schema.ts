@@ -1,6 +1,37 @@
 import type { AnyAgentTool } from "./pi-tools.types.js";
 import { cleanSchemaForGemini } from "./schema/clean-for-gemini.js";
 
+function normalizeRequiredArrays(schema: unknown): unknown {
+  if (!schema || typeof schema !== "object") {
+    return schema;
+  }
+  if (Array.isArray(schema)) {
+    let touched = false;
+    const items = schema.map((entry) => {
+      const normalized = normalizeRequiredArrays(entry);
+      if (normalized !== entry) {
+        touched = true;
+      }
+      return normalized;
+    });
+    return touched ? items : schema;
+  }
+
+  let touched = false;
+  const next: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
+    let normalized = normalizeRequiredArrays(value);
+    if (key === "required" && normalized === null) {
+      normalized = [];
+    }
+    if (normalized !== value) {
+      touched = true;
+    }
+    next[key] = normalized;
+  }
+  return touched ? next : schema;
+}
+
 function extractEnumValues(schema: unknown): unknown[] | undefined {
   if (!schema || typeof schema !== "object") {
     return undefined;
@@ -66,13 +97,14 @@ export function normalizeToolParameters(
   tool: AnyAgentTool,
   options?: { modelProvider?: string },
 ): AnyAgentTool {
-  const schema =
+  const rawSchema =
     tool.parameters && typeof tool.parameters === "object"
       ? (tool.parameters as Record<string, unknown>)
       : undefined;
-  if (!schema) {
+  if (!rawSchema) {
     return tool;
   }
+  const schema = normalizeRequiredArrays(rawSchema) as Record<string, unknown>;
 
   // Provider quirks:
   // - Gemini rejects several JSON Schema keywords, so we scrub those.
@@ -120,7 +152,13 @@ export function normalizeToolParameters(
       ? "oneOf"
       : null;
   if (!variantKey) {
-    return tool;
+    if (schema === rawSchema) {
+      return tool;
+    }
+    return {
+      ...tool,
+      parameters: schema,
+    };
   }
   const variants = schema[variantKey] as unknown[];
   const mergedProperties: Record<string, unknown> = {};
