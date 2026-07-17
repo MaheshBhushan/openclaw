@@ -23,29 +23,23 @@ struct WizardCliOptions {
             case "--json":
                 opts.json = true
             case "--url":
-                opts.url = self.nextValue(args, index: &i)
+                opts.url = CLIArgParsingSupport.nextValue(args, index: &i)
             case "--token":
-                opts.token = self.nextValue(args, index: &i)
+                opts.token = CLIArgParsingSupport.nextValue(args, index: &i)
             case "--password":
-                opts.password = self.nextValue(args, index: &i)
+                opts.password = CLIArgParsingSupport.nextValue(args, index: &i)
             case "--mode":
-                if let value = nextValue(args, index: &i) {
+                if let value = CLIArgParsingSupport.nextValue(args, index: &i) {
                     opts.mode = value
                 }
             case "--workspace":
-                opts.workspace = self.nextValue(args, index: &i)
+                opts.workspace = CLIArgParsingSupport.nextValue(args, index: &i)
             default:
                 break
             }
             i += 1
         }
         return opts
-    }
-
-    private static func nextValue(_ args: [String], index: inout Int) -> String? {
-        guard index + 1 < args.count else { return nil }
-        index += 1
-        return args[index].trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -213,7 +207,7 @@ actor GatewayWizardClient {
             let frame = try decodeFrame(message)
             if case let .res(res) = frame, res.id == id {
                 if res.ok == false {
-                    let msg = (res.error?["message"]?.value as? String) ?? "gateway error"
+                    let msg = res.error?.message ?? "gateway error"
                     throw WizardCliError.gatewayError(msg)
                 }
                 return res
@@ -263,7 +257,7 @@ actor GatewayWizardClient {
         ]
 
         var params: [String: ProtoAnyCodable] = [
-            "minProtocol": ProtoAnyCodable(GATEWAY_PROTOCOL_VERSION),
+            "minProtocol": ProtoAnyCodable(GATEWAY_MIN_PROTOCOL_VERSION),
             "maxProtocol": ProtoAnyCodable(GATEWAY_PROTOCOL_VERSION),
             "client": ProtoAnyCodable(client),
             "caps": ProtoAnyCodable([String]()),
@@ -279,30 +273,22 @@ actor GatewayWizardClient {
         }
         let connectNonce = try await self.waitForConnectChallenge()
         let identity = DeviceIdentityStore.loadOrCreate()
-        let signedAtMs = Int(Date().timeIntervalSince1970 * 1000)
-        let scopesValue = scopes.joined(separator: ",")
-        let payloadParts = [
-            "v2",
-            identity.deviceId,
-            clientId,
-            clientMode,
-            role,
-            scopesValue,
-            String(signedAtMs),
-            self.token ?? "",
-            connectNonce,
-        ]
-        let payload = payloadParts.joined(separator: "|")
-        if let signature = DeviceIdentityStore.signPayload(payload, identity: identity),
-           let publicKey = DeviceIdentityStore.publicKeyBase64Url(identity)
+        let signedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let payload = GatewayDeviceAuthPayload.buildConnectCompatibilityPayload(
+            fields: .init(
+                deviceId: identity.deviceId,
+                client: .init(id: clientId, mode: clientMode),
+                role: role,
+                scopes: scopes,
+                signedAtMs: signedAtMs,
+                token: self.token,
+                nonce: connectNonce))
+        if let device = GatewayDeviceAuthPayload.signedDeviceDictionary(
+            payload: payload,
+            identity: identity,
+            signedAtMs: signedAtMs,
+            nonce: connectNonce)
         {
-            let device: [String: ProtoAnyCodable] = [
-                "id": ProtoAnyCodable(identity.deviceId),
-                "publicKey": ProtoAnyCodable(publicKey),
-                "signature": ProtoAnyCodable(signature),
-                "signedAt": ProtoAnyCodable(signedAtMs),
-                "nonce": ProtoAnyCodable(connectNonce),
-            ]
             params["device"] = ProtoAnyCodable(device)
         }
 
@@ -320,7 +306,7 @@ actor GatewayWizardClient {
             let frameResponse = try decodeFrame(message)
             if case let .res(res) = frameResponse, res.id == reqId {
                 if res.ok == false {
-                    let msg = (res.error?["message"]?.value as? String) ?? "gateway connect failed"
+                    let msg = res.error?.message ?? "gateway connect failed"
                     throw WizardCliError.gatewayError(msg)
                 }
                 _ = try self.decodePayload(res, as: HelloOk.self)
@@ -340,8 +326,7 @@ actor GatewayWizardClient {
                     let frame = try await self.decodeFrame(message)
                     if case let .event(evt) = frame, evt.event == "connect.challenge",
                        let payload = evt.payload?.value as? [String: ProtoAnyCodable],
-                       let nonce = payload["nonce"]?.value as? String,
-                       nonce.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                       let nonce = GatewayConnectChallengeSupport.nonce(from: payload)
                     {
                         return nonce
                     }
@@ -387,8 +372,11 @@ private func runWizard(client: GatewayWizardClient, opts: WizardCliOptions) asyn
                 print("Wizard complete.")
                 return
             }
+            if let error = nextResult.error, !opts.json {
+                fputs("wizard: \(error)\n", stderr)
+            }
 
-            if let step = decodeWizardStep(nextResult.step) {
+            if let step = nextResult.step {
                 let answer = try promptAnswer(for: step)
                 var answerPayload: [String: ProtoAnyCodable] = [
                     "stepId": ProtoAnyCodable(step.id),
@@ -458,6 +446,12 @@ private func promptAnswer(for step: WizardStep) throws -> Any {
     case "text":
         let initial = anyCodableString(step.initialvalue)
         let prompt = step.placeholder ?? "Value"
+        if step.sensitive == true {
+            let sensitivePrompt = initial.isEmpty ? prompt : "\(prompt) (leave blank to keep existing)"
+            let value = try readSensitiveLineWithPrompt(sensitivePrompt)
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? initial : trimmed
+        }
         let value = try readLineWithPrompt("\(prompt)\(initial.isEmpty ? "" : " [\(initial)]")")
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? initial : trimmed
@@ -532,6 +526,31 @@ private func promptMultiSelect(_ step: WizardStep) throws -> [Any] {
 
 private func readLineWithPrompt(_ prompt: String) throws -> String {
     print("\(prompt): ", terminator: "")
+    guard let line = readLine() else {
+        throw WizardCliError.cancelled
+    }
+    return line
+}
+
+private func readSensitiveLineWithPrompt(_ prompt: String) throws -> String {
+    print("\(prompt): ", terminator: "")
+    fflush(stdout)
+
+    var original = termios()
+    guard tcgetattr(STDIN_FILENO, &original) == 0 else {
+        throw WizardCliError.gatewayError("Could not configure hidden terminal input.")
+    }
+
+    var hidden = original
+    hidden.c_lflag &= ~tcflag_t(ECHO)
+    guard tcsetattr(STDIN_FILENO, TCSANOW, &hidden) == 0 else {
+        throw WizardCliError.gatewayError("Could not configure hidden terminal input.")
+    }
+    defer {
+        _ = tcsetattr(STDIN_FILENO, TCSANOW, &original)
+        print("")
+    }
+
     guard let line = readLine() else {
         throw WizardCliError.cancelled
     }

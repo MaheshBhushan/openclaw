@@ -1,3 +1,5 @@
+// Gateway HTTP server routes control UI, OpenAI-compatible APIs, plugin HTTP
+// surfaces, hooks, readiness, auth, and WebSocket upgrades.
 import {
   createServer as createHttpServer,
   type Server as HttpServer,
@@ -7,166 +9,297 @@ import {
 import { createServer as createHttpsServer } from "node:https";
 import type { TlsOptions } from "node:tls";
 import type { WebSocketServer } from "ws";
-import { resolveAgentAvatar } from "../agents/identity-avatar.js";
+import { resolveBundledChannelGatewayAuthBypassPaths } from "../channels/plugins/gateway-auth-bypass.js";
+import { getRuntimeConfig } from "../config/io.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
-  A2UI_PATH,
-  CANVAS_HOST_PATH,
-  CANVAS_WS_PATH,
-  handleA2uiHttpRequest,
-} from "../canvas-host/a2ui.js";
-import type { CanvasHostHandler } from "../canvas-host/server.js";
-import { loadConfig } from "../config/config.js";
-import type { createSubsystemLogger } from "../logging/subsystem.js";
-import { safeEqualSecret } from "../security/secret-equal.js";
-import { handleSlackHttpRequest } from "../slack/http/index.js";
-import {
-  AUTH_RATE_LIMIT_SCOPE_HOOK_AUTH,
-  createAuthRateLimiter,
-  normalizeRateLimitClientIp,
-  type AuthRateLimiter,
-} from "./auth-rate-limit.js";
+  createDiagnosticTraceContext,
+  runWithDiagnosticTraceContext,
+} from "../infra/diagnostic-trace-context.js";
+import { isGatewayWorkAdmissionClosed } from "../process/gateway-work-admission.js";
+import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
+import { resolveAssistantIdentity } from "./assistant-identity.js";
+import type { AuthRateLimiter } from "./auth-rate-limit.js";
 import {
   authorizeHttpGatewayConnect,
   isLocalDirectRequest,
   type GatewayAuthResult,
   type ResolvedGatewayAuth,
 } from "./auth.js";
-import { CANVAS_CAPABILITY_TTL_MS, normalizeCanvasScopedUrl } from "./canvas-capability.js";
 import {
-  handleControlUiAvatarRequest,
-  handleControlUiHttpRequest,
-  type ControlUiRootState,
-} from "./control-ui.js";
-import { applyHookMappings } from "./hooks-mapping.js";
+  CONTROL_UI_CATALOG_ICON_PATH_PREFIX,
+  CONTROL_UI_PLUGIN_ICON_PATH_PREFIX,
+} from "./control-ui-contract.js";
 import {
-  extractHookToken,
-  getHookAgentPolicyError,
-  getHookChannelError,
-  type HookAgentDispatchPayload,
-  type HooksConfigResolved,
-  isHookAgentAllowed,
-  normalizeAgentPayload,
-  normalizeHookHeaders,
-  normalizeWakePayload,
-  readJsonBody,
-  resolveHookSessionKey,
-  resolveHookTargetAgentId,
-  resolveHookChannel,
-  resolveHookDeliver,
-} from "./hooks.js";
+  isControlUiApprovalDocumentPath,
+  isControlUiPluginManagerRequest,
+} from "./control-ui-routing.js";
+import type { ControlUiRootState } from "./control-ui.js";
+import type { AuthorizedGatewayHttpRequest } from "./http-auth-utils.js";
 import { sendGatewayAuthFailure, setDefaultSecurityHeaders } from "./http-common.js";
-import { getBearerToken } from "./http-utils.js";
-import { handleOpenAiHttpRequest } from "./openai-http.js";
-import { handleOpenResponsesHttpRequest } from "./openresponses-http.js";
-import { GATEWAY_CLIENT_MODES, normalizeGatewayClientMode } from "./protocol/client-info.js";
-import type { GatewayWsClient } from "./server/ws-types.js";
-import { handleToolsInvokeHttpRequest } from "./tools-invoke-http.js";
+import { resolveRequestClientIp } from "./net.js";
+import {
+  normalizePluginNodeCapabilityScopedUrl,
+  type PluginNodeCapabilitySurface,
+} from "./plugin-node-capability.js";
+import type { HooksRequestHandler } from "./server/hooks-request-handler.js";
+import {
+  runWithGatewayHttpWorkAdmission,
+  writeGatewayUpgradeServiceUnavailable,
+} from "./server/http-work-admission.js";
+import {
+  isProtectedPluginRoutePathFromContext,
+  resolvePluginRoutePathContext,
+  type PluginRoutePathContext,
+} from "./server/plugins-http/path-context.js";
+import type { PreauthConnectionBudget } from "./server/preauth-connection-budget.js";
+import type { ReadinessChecker } from "./server/readiness.js";
+import {
+  GATEWAY_WS_CONNECTION_KIND_PROPERTY,
+  GATEWAY_WS_PREAUTH_BUDGET_PROPERTY,
+  type GatewayIngressWebSocket,
+  type GatewayWsClient,
+} from "./server/ws-types.js";
 
-type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
+type PluginHttpRequestHandler = (
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathContext?: PluginRoutePathContext,
+  dispatchContext?: {
+    gatewayAuthSatisfied?: boolean;
+    gatewayRequestAuth?: AuthorizedGatewayHttpRequest;
+    gatewayRequestOperatorScopes?: readonly string[];
+    gatewayRequestClientIp?: string;
+  },
+) => Promise<boolean>;
 
-const HOOK_AUTH_FAILURE_LIMIT = 20;
-const HOOK_AUTH_FAILURE_WINDOW_MS = 60_000;
+type WatchNodeHttpRequestHandler = (req: IncomingMessage, res: ServerResponse) => Promise<boolean>;
 
-type HookDispatchers = {
-  dispatchWakeHook: (value: { text: string; mode: "now" | "next-heartbeat" }) => void;
-  dispatchAgentHook: (value: HookAgentDispatchPayload) => string;
-};
+type PluginHttpUpgradeHandler = (
+  req: IncomingMessage,
+  socket: import("node:stream").Duplex,
+  head: Buffer,
+  pathContext?: PluginRoutePathContext,
+  dispatchContext?: {
+    gatewayAuthSatisfied?: boolean;
+    gatewayRequestAuth?: AuthorizedGatewayHttpRequest;
+    gatewayRequestOperatorScopes?: readonly string[];
+    gatewayRequestClientIp?: string;
+  },
+) => Promise<boolean>;
 
-function sendJson(res: ServerResponse, status: number, body: unknown) {
-  res.statusCode = status;
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.end(JSON.stringify(body));
+type ResolvePluginNodeCapabilityRoute = (
+  pathContext: PluginRoutePathContext,
+) => PluginNodeCapabilitySurface | undefined;
+
+const getControlUiModule = createLazyRuntimeModule(() => import("./control-ui.js"));
+
+const getEmbeddingsHttpModule = createLazyRuntimeModule(() => import("./embeddings-http.js"));
+
+const getManagedImageAttachmentsModule = createLazyRuntimeModule(
+  () => import("./managed-image-attachments.js"),
+);
+
+const getPluginIconHttpModule = createLazyRuntimeModule(() => import("./plugin-icon-http.js"));
+
+const getModelsHttpModule = createLazyRuntimeModule(() => import("./models-http.js"));
+
+const getOpenAiHttpModule = createLazyRuntimeModule(() => import("./openai-http.js"));
+
+const getOpenResponsesHttpModule = createLazyRuntimeModule(() => import("./openresponses-http.js"));
+
+const getSessionHistoryHttpModule = createLazyRuntimeModule(
+  () => import("./sessions-history-http.js"),
+);
+
+const getSessionKillHttpModule = createLazyRuntimeModule(() => import("./session-kill-http.js"));
+
+const getToolsInvokeHttpModule = createLazyRuntimeModule(() => import("./tools-invoke-http.js"));
+
+const getPluginNodeCapabilityAuthModule = createLazyRuntimeModule(
+  () => import("./server/plugin-node-capability-auth.js"),
+);
+
+const getHttpAuthUtilsModule = createLazyRuntimeModule(() => import("./http-auth-utils.js"));
+
+const getPluginRouteRuntimeScopesModule = createLazyRuntimeModule(
+  () => import("./server/plugin-route-runtime-scopes.js"),
+);
+
+const GATEWAY_PROBE_STATUS_BY_PATH = new Map<string, "live" | "ready">([
+  ["/health", "live"],
+  ["/healthz", "live"],
+  ["/ready", "ready"],
+  ["/readyz", "ready"],
+]);
+
+function isControlUiCatalogIconRequest(pathname: string, basePath: string): boolean {
+  const normalizedBasePath =
+    basePath && basePath !== "/" ? (basePath.endsWith("/") ? basePath.slice(0, -1) : basePath) : "";
+  return [CONTROL_UI_PLUGIN_ICON_PATH_PREFIX, CONTROL_UI_CATALOG_ICON_PATH_PREFIX].some((prefix) =>
+    pathname.startsWith(`${normalizedBasePath}${prefix}/`),
+  );
+}
+const pluginGatewayAuthBypassPathsCache = new WeakMap<
+  OpenClawConfig,
+  Promise<ReadonlySet<string>>
+>();
+
+async function resolvePluginGatewayAuthBypassPaths(
+  configSnapshot: OpenClawConfig,
+): Promise<Set<string>> {
+  const paths = new Set<string>();
+  const configuredChannels = configSnapshot.channels;
+  if (!configuredChannels || Object.keys(configuredChannels).length === 0) {
+    return paths;
+  }
+  for (const channelId of Object.keys(configuredChannels)) {
+    for (const path of await resolveBundledChannelGatewayAuthBypassPaths({
+      channelId,
+      cfg: configSnapshot,
+    })) {
+      paths.add(path);
+    }
+  }
+  return paths;
 }
 
-function isCanvasPath(pathname: string): boolean {
+function getCachedPluginGatewayAuthBypassPaths(
+  configSnapshot: OpenClawConfig,
+): Promise<ReadonlySet<string>> {
+  const cached = pluginGatewayAuthBypassPathsCache.get(configSnapshot);
+  if (cached) {
+    return cached;
+  }
+  const resolved = resolvePluginGatewayAuthBypassPaths(configSnapshot).catch((error: unknown) => {
+    pluginGatewayAuthBypassPathsCache.delete(configSnapshot);
+    throw error;
+  });
+  pluginGatewayAuthBypassPathsCache.set(configSnapshot, resolved);
+  return resolved;
+}
+
+function isOpenAiModelsPath(pathname: string): boolean {
+  return pathname === "/v1/models" || pathname.startsWith("/v1/models/");
+}
+
+function isEmbeddingsPath(pathname: string): boolean {
+  return pathname === "/v1/embeddings";
+}
+
+function isOpenAiChatCompletionsPath(pathname: string): boolean {
+  return pathname === "/v1/chat/completions";
+}
+
+function isOpenResponsesPath(pathname: string): boolean {
+  return pathname === "/v1/responses";
+}
+
+function isToolsInvokePath(pathname: string): boolean {
+  return pathname === "/tools/invoke";
+}
+
+function isManagedOutgoingImagePath(pathname: string): boolean {
+  return pathname.startsWith("/api/chat/media/outgoing/");
+}
+
+function isSessionKillPath(pathname: string): boolean {
+  return /^\/sessions\/[^/]+\/kill$/.test(pathname);
+}
+
+function isSessionHistoryPath(pathname: string): boolean {
+  return /^\/sessions\/[^/]+\/history$/.test(pathname);
+}
+
+function shouldEnforceDefaultPluginGatewayAuth(pathContext: PluginRoutePathContext): boolean {
   return (
-    pathname === A2UI_PATH ||
-    pathname.startsWith(`${A2UI_PATH}/`) ||
-    pathname === CANVAS_HOST_PATH ||
-    pathname.startsWith(`${CANVAS_HOST_PATH}/`) ||
-    pathname === CANVAS_WS_PATH
+    pathContext.malformedEncoding ||
+    pathContext.decodePassLimitReached ||
+    isProtectedPluginRoutePathFromContext(pathContext)
   );
 }
 
-function isNodeWsClient(client: GatewayWsClient): boolean {
-  if (client.connect.role === "node") {
-    return true;
-  }
-  return normalizeGatewayClientMode(client.connect.client.mode) === GATEWAY_CLIENT_MODES.NODE;
-}
-
-function hasAuthorizedNodeWsClientForCanvasCapability(
-  clients: Set<GatewayWsClient>,
-  capability: string,
-): boolean {
-  const nowMs = Date.now();
-  for (const client of clients) {
-    if (!isNodeWsClient(client)) {
-      continue;
-    }
-    if (!client.canvasCapability || !client.canvasCapabilityExpiresAtMs) {
-      continue;
-    }
-    if (client.canvasCapabilityExpiresAtMs <= nowMs) {
-      continue;
-    }
-    if (safeEqualSecret(client.canvasCapability, capability)) {
-      // Sliding expiration while the connected node keeps using canvas.
-      client.canvasCapabilityExpiresAtMs = nowMs + CANVAS_CAPABILITY_TTL_MS;
-      return true;
-    }
-  }
-  return false;
-}
-
-async function authorizeCanvasRequest(params: {
+async function canRevealReadinessDetails(params: {
   req: IncomingMessage;
-  auth: ResolvedGatewayAuth;
+  resolvedAuth: ResolvedGatewayAuth;
   trustedProxies: string[];
   allowRealIpFallback: boolean;
-  clients: Set<GatewayWsClient>;
-  canvasCapability?: string;
-  malformedScopedPath?: boolean;
-  rateLimiter?: AuthRateLimiter;
-}): Promise<GatewayAuthResult> {
-  const {
-    req,
-    auth,
-    trustedProxies,
-    allowRealIpFallback,
-    clients,
-    canvasCapability,
-    malformedScopedPath,
-    rateLimiter,
-  } = params;
-  if (malformedScopedPath) {
-    return { ok: false, reason: "unauthorized" };
+}): Promise<boolean> {
+  // Readiness details expose subsystem names; show them only to local direct callers or
+  // requests that prove gateway auth, while unauthenticated remote probes get a boolean.
+  if (isLocalDirectRequest(params.req, params.trustedProxies, params.allowRealIpFallback)) {
+    return true;
   }
-  if (isLocalDirectRequest(req, trustedProxies, allowRealIpFallback)) {
-    return { ok: true };
+  if (params.resolvedAuth.mode === "none") {
+    return false;
   }
 
-  let lastAuthFailure: GatewayAuthResult | null = null;
-  const token = getBearerToken(req);
-  if (token) {
-    const authResult = await authorizeHttpGatewayConnect({
-      auth: { ...auth, allowTailscale: false },
-      connectAuth: { token, password: token },
+  const { getBearerToken, resolveHttpBrowserOriginPolicy } = await getHttpAuthUtilsModule();
+  const bearerToken = getBearerToken(params.req);
+  const authResult = await authorizeHttpGatewayConnect({
+    auth: params.resolvedAuth,
+    connectAuth: bearerToken ? { token: bearerToken, password: bearerToken } : null,
+    req: params.req,
+    trustedProxies: params.trustedProxies,
+    allowRealIpFallback: params.allowRealIpFallback,
+    browserOriginPolicy: resolveHttpBrowserOriginPolicy(params.req),
+  });
+  return authResult.ok;
+}
+
+/** Handles live/ready probe endpoints before normal gateway routing. */
+async function handleGatewayProbeRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  requestPath: string,
+  resolvedAuth: ResolvedGatewayAuth,
+  trustedProxies: string[],
+  allowRealIpFallback: boolean,
+  getReadiness?: ReadinessChecker,
+): Promise<boolean> {
+  const status = GATEWAY_PROBE_STATUS_BY_PATH.get(requestPath);
+  if (!status) {
+    return false;
+  }
+
+  const method = (req.method ?? "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    res.statusCode = 405;
+    res.setHeader("Allow", "GET, HEAD");
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.end("Method Not Allowed");
+    return true;
+  }
+
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+
+  let statusCode: number;
+  let body: string;
+  if (status === "ready" && getReadiness) {
+    const includeDetails = await canRevealReadinessDetails({
       req,
+      resolvedAuth,
       trustedProxies,
       allowRealIpFallback,
-      rateLimiter,
     });
-    if (authResult.ok) {
-      return authResult;
+    try {
+      const result = getReadiness();
+      statusCode = result.ready ? 200 : 503;
+      body = JSON.stringify(includeDetails ? result : { ready: result.ready });
+    } catch {
+      statusCode = 503;
+      body = JSON.stringify(
+        includeDetails ? { ready: false, failing: ["internal"], uptimeMs: 0 } : { ready: false },
+      );
     }
-    lastAuthFailure = authResult;
+  } else {
+    statusCode = 200;
+    body = JSON.stringify({ ok: true, status });
   }
-
-  if (canvasCapability && hasAuthorizedNodeWsClientForCanvasCapability(clients, canvasCapability)) {
-    return { ok: true };
-  }
-  return lastAuthFailure ?? { ok: false, reason: "unauthorized" };
+  res.statusCode = statusCode;
+  res.end(method === "HEAD" ? undefined : body);
+  return true;
 }
 
 function writeUpgradeAuthFailure(
@@ -198,257 +331,187 @@ function writeUpgradeAuthFailure(
   socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
 }
 
-export type HooksRequestHandler = (req: IncomingMessage, res: ServerResponse) => Promise<boolean>;
-
-export function createHooksRequestHandler(
-  opts: {
-    getHooksConfig: () => HooksConfigResolved | null;
-    bindHost: string;
-    port: number;
-    logHooks: SubsystemLogger;
-  } & HookDispatchers,
-): HooksRequestHandler {
-  const { getHooksConfig, logHooks, dispatchAgentHook, dispatchWakeHook } = opts;
-  const hookAuthLimiter = createAuthRateLimiter({
-    maxAttempts: HOOK_AUTH_FAILURE_LIMIT,
-    windowMs: HOOK_AUTH_FAILURE_WINDOW_MS,
-    lockoutMs: HOOK_AUTH_FAILURE_WINDOW_MS,
-    exemptLoopback: false,
-    // Handler lifetimes are tied to gateway runtime/tests; skip background timer fanout.
-    pruneIntervalMs: 0,
-  });
-
-  const resolveHookClientKey = (req: IncomingMessage): string => {
-    return normalizeRateLimitClientIp(req.socket?.remoteAddress);
-  };
-
-  return async (req, res) => {
-    const hooksConfig = getHooksConfig();
-    if (!hooksConfig) {
-      return false;
-    }
-    // Only pathname/search are used here; keep the base host fixed so bind-host
-    // representation (e.g. IPv6 wildcards) cannot break request parsing.
-    const url = new URL(req.url ?? "/", "http://localhost");
-    const basePath = hooksConfig.basePath;
-    if (url.pathname !== basePath && !url.pathname.startsWith(`${basePath}/`)) {
-      return false;
-    }
-
-    if (url.searchParams.has("token")) {
-      res.statusCode = 400;
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end(
-        "Hook token must be provided via Authorization: Bearer <token> or X-OpenClaw-Token header (query parameters are not allowed).",
-      );
-      return true;
-    }
-
-    const token = extractHookToken(req);
-    const clientKey = resolveHookClientKey(req);
-    if (!safeEqualSecret(token, hooksConfig.token)) {
-      const throttle = hookAuthLimiter.check(clientKey, AUTH_RATE_LIMIT_SCOPE_HOOK_AUTH);
-      if (!throttle.allowed) {
-        const retryAfter = throttle.retryAfterMs > 0 ? Math.ceil(throttle.retryAfterMs / 1000) : 1;
-        res.statusCode = 429;
-        res.setHeader("Retry-After", String(retryAfter));
-        res.setHeader("Content-Type", "text/plain; charset=utf-8");
-        res.end("Too Many Requests");
-        logHooks.warn(`hook auth throttled for ${clientKey}; retry-after=${retryAfter}s`);
-        return true;
-      }
-      hookAuthLimiter.recordFailure(clientKey, AUTH_RATE_LIMIT_SCOPE_HOOK_AUTH);
-      res.statusCode = 401;
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end("Unauthorized");
-      return true;
-    }
-    hookAuthLimiter.reset(clientKey, AUTH_RATE_LIMIT_SCOPE_HOOK_AUTH);
-
-    if (req.method !== "POST") {
-      res.statusCode = 405;
-      res.setHeader("Allow", "POST");
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end("Method Not Allowed");
-      return true;
-    }
-
-    const subPath = url.pathname.slice(basePath.length).replace(/^\/+/, "");
-    if (!subPath) {
-      res.statusCode = 404;
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end("Not Found");
-      return true;
-    }
-
-    const body = await readJsonBody(req, hooksConfig.maxBodyBytes);
-    if (!body.ok) {
-      const status =
-        body.error === "payload too large"
-          ? 413
-          : body.error === "request body timeout"
-            ? 408
-            : 400;
-      sendJson(res, status, { ok: false, error: body.error });
-      return true;
-    }
-
-    const payload = typeof body.value === "object" && body.value !== null ? body.value : {};
-    const headers = normalizeHookHeaders(req);
-
-    if (subPath === "wake") {
-      const normalized = normalizeWakePayload(payload as Record<string, unknown>);
-      if (!normalized.ok) {
-        sendJson(res, 400, { ok: false, error: normalized.error });
-        return true;
-      }
-      dispatchWakeHook(normalized.value);
-      sendJson(res, 200, { ok: true, mode: normalized.value.mode });
-      return true;
-    }
-
-    if (subPath === "agent") {
-      const normalized = normalizeAgentPayload(payload as Record<string, unknown>);
-      if (!normalized.ok) {
-        sendJson(res, 400, { ok: false, error: normalized.error });
-        return true;
-      }
-      if (!isHookAgentAllowed(hooksConfig, normalized.value.agentId)) {
-        sendJson(res, 400, { ok: false, error: getHookAgentPolicyError() });
-        return true;
-      }
-      const sessionKey = resolveHookSessionKey({
-        hooksConfig,
-        source: "request",
-        sessionKey: normalized.value.sessionKey,
-      });
-      if (!sessionKey.ok) {
-        sendJson(res, 400, { ok: false, error: sessionKey.error });
-        return true;
-      }
-      const runId = dispatchAgentHook({
-        ...normalized.value,
-        sessionKey: sessionKey.value,
-        agentId: resolveHookTargetAgentId(hooksConfig, normalized.value.agentId),
-      });
-      sendJson(res, 202, { ok: true, runId });
-      return true;
-    }
-
-    if (hooksConfig.mappings.length > 0) {
-      try {
-        const mapped = await applyHookMappings(hooksConfig.mappings, {
-          payload: payload as Record<string, unknown>,
-          headers,
-          url,
-          path: subPath,
-        });
-        if (mapped) {
-          if (!mapped.ok) {
-            sendJson(res, 400, { ok: false, error: mapped.error });
-            return true;
-          }
-          if (mapped.action === null) {
-            res.statusCode = 204;
-            res.end();
-            return true;
-          }
-          if (mapped.action.kind === "wake") {
-            dispatchWakeHook({
-              text: mapped.action.text,
-              mode: mapped.action.mode,
-            });
-            sendJson(res, 200, { ok: true, mode: mapped.action.mode });
-            return true;
-          }
-          const channel = resolveHookChannel(mapped.action.channel);
-          if (!channel) {
-            sendJson(res, 400, { ok: false, error: getHookChannelError() });
-            return true;
-          }
-          if (!isHookAgentAllowed(hooksConfig, mapped.action.agentId)) {
-            sendJson(res, 400, { ok: false, error: getHookAgentPolicyError() });
-            return true;
-          }
-          const sessionKey = resolveHookSessionKey({
-            hooksConfig,
-            source: "mapping",
-            sessionKey: mapped.action.sessionKey,
-          });
-          if (!sessionKey.ok) {
-            sendJson(res, 400, { ok: false, error: sessionKey.error });
-            return true;
-          }
-          const runId = dispatchAgentHook({
-            message: mapped.action.message,
-            name: mapped.action.name ?? "Hook",
-            agentId: resolveHookTargetAgentId(hooksConfig, mapped.action.agentId),
-            wakeMode: mapped.action.wakeMode,
-            sessionKey: sessionKey.value,
-            deliver: resolveHookDeliver(mapped.action.deliver),
-            channel,
-            to: mapped.action.to,
-            model: mapped.action.model,
-            thinking: mapped.action.thinking,
-            timeoutSeconds: mapped.action.timeoutSeconds,
-            allowUnsafeExternalContent: mapped.action.allowUnsafeExternalContent,
-          });
-          sendJson(res, 202, { ok: true, runId });
-          return true;
-        }
-      } catch (err) {
-        logHooks.warn(`hook mapping failed: ${String(err)}`);
-        sendJson(res, 500, { ok: false, error: "hook mapping failed" });
-        return true;
-      }
-    }
-
-    res.statusCode = 404;
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.end("Not Found");
-    return true;
-  };
+function parseGatewayRequestPath(rawUrl: string | undefined): string | undefined {
+  try {
+    return new URL(rawUrl ?? "/", "http://localhost").pathname;
+  } catch {
+    return undefined;
+  }
 }
 
+type GatewayHttpRequestStage = {
+  name: string;
+  run: () => Promise<boolean> | boolean;
+  continueOnError?: boolean;
+};
+
+async function runGatewayHttpRequestStages(
+  stages: readonly GatewayHttpRequestStage[],
+): Promise<boolean> {
+  for (const stage of stages) {
+    try {
+      if (await stage.run()) {
+        return true;
+      }
+    } catch (err) {
+      if (!stage.continueOnError) {
+        throw err;
+      }
+      // Log and skip the failing stage so subsequent stages (control-ui,
+      // gateway-probes, etc.) remain reachable. A common trigger is a
+      // plugin-owned route/runtime code still failing to load an optional dependency.
+      console.error(`[gateway-http] stage "${stage.name}" threw — skipping:`, err);
+    }
+  }
+  return false;
+}
+
+function buildPluginRequestStages(params: {
+  req: IncomingMessage;
+  res: ServerResponse;
+  requestPath: string;
+  getGatewayAuthBypassPaths: () => Promise<ReadonlySet<string>>;
+  pluginPathContext: PluginRoutePathContext | null;
+  handlePluginRequest?: PluginHttpRequestHandler;
+  shouldEnforcePluginGatewayAuth?: (pathContext: PluginRoutePathContext) => boolean;
+  resolvedAuth: ResolvedGatewayAuth;
+  trustedProxies: string[];
+  allowRealIpFallback: boolean;
+  rateLimiter?: AuthRateLimiter;
+}): GatewayHttpRequestStage[] {
+  if (!params.handlePluginRequest) {
+    return [];
+  }
+  const requestClientIp = resolveRequestClientIp(
+    params.req,
+    params.trustedProxies,
+    params.allowRealIpFallback,
+  );
+  let pluginGatewayAuthSatisfied = false;
+  let pluginGatewayRequestAuth: AuthorizedGatewayHttpRequest | undefined;
+  let pluginRequestOperatorScopes: string[] | undefined;
+  // Plugin auth and plugin dispatch are separate stages so route handlers receive the
+  // gateway-auth context while plugin failures can still fall through to core/Control UI routes.
+  return [
+    {
+      name: "plugin-auth",
+      run: async () => {
+        const pathContext =
+          params.pluginPathContext ?? resolvePluginRoutePathContext(params.requestPath);
+        if (
+          !(params.shouldEnforcePluginGatewayAuth ?? shouldEnforceDefaultPluginGatewayAuth)(
+            pathContext,
+          )
+        ) {
+          return false;
+        }
+        if ((await params.getGatewayAuthBypassPaths()).has(params.requestPath)) {
+          return false;
+        }
+        // Bypass paths come only from activated channel plugins' gateway-auth
+        // artifacts (bundled or installed); all other protected plugin routes must
+        // produce an AuthorizedGatewayHttpRequest before runtime scopes are derived.
+        const { authorizePluginGatewayHttpRequestOrReply } = await getHttpAuthUtilsModule();
+        const { resolvePluginRouteRuntimeOperatorScopes } =
+          await getPluginRouteRuntimeScopesModule();
+        const authResult = await authorizePluginGatewayHttpRequestOrReply({
+          req: params.req,
+          res: params.res,
+          auth: params.resolvedAuth,
+          trustedProxies: params.trustedProxies,
+          allowRealIpFallback: params.allowRealIpFallback,
+          rateLimiter: params.rateLimiter,
+          requestPath: params.requestPath,
+          resolveOperatorScopes: resolvePluginRouteRuntimeOperatorScopes,
+        });
+        if (!authResult) {
+          return true;
+        }
+        pluginGatewayAuthSatisfied = true;
+        pluginGatewayRequestAuth = authResult.requestAuth;
+        pluginRequestOperatorScopes = authResult.operatorScopes;
+        return false;
+      },
+    },
+    {
+      name: "plugin-http",
+      continueOnError: true,
+      run: () => {
+        const pathContext =
+          params.pluginPathContext ?? resolvePluginRoutePathContext(params.requestPath);
+        return (
+          params.handlePluginRequest?.(params.req, params.res, pathContext, {
+            gatewayAuthSatisfied: pluginGatewayAuthSatisfied,
+            gatewayRequestAuth: pluginGatewayRequestAuth,
+            gatewayRequestOperatorScopes: pluginRequestOperatorScopes,
+            gatewayRequestClientIp: requestClientIp,
+          }) ?? false
+        );
+      },
+    },
+  ];
+}
+
+/** Creates the gateway HTTP/HTTPS server and ordered request-stage router. */
 export function createGatewayHttpServer(opts: {
-  canvasHost: CanvasHostHandler | null;
   clients: Set<GatewayWsClient>;
   controlUiEnabled: boolean;
   controlUiBasePath: string;
   controlUiRoot?: ControlUiRootState;
   openAiChatCompletionsEnabled: boolean;
+  openAiChatCompletionsConfig?: import("../config/types.gateway.js").GatewayHttpChatCompletionsConfig;
   openResponsesEnabled: boolean;
   openResponsesConfig?: import("../config/types.gateway.js").GatewayHttpResponsesConfig;
   strictTransportSecurityHeader?: string;
   handleHooksRequest: HooksRequestHandler;
-  handlePluginRequest?: HooksRequestHandler;
+  handleWatchNodeRequest?: WatchNodeHttpRequestHandler;
+  handlePluginRequest?: PluginHttpRequestHandler;
+  handlePluginUpgrade?: PluginHttpUpgradeHandler;
+  shouldEnforcePluginGatewayAuth?: (pathContext: PluginRoutePathContext) => boolean;
+  resolvePluginNodeCapabilityRoute?: ResolvePluginNodeCapabilityRoute;
   resolvedAuth: ResolvedGatewayAuth;
+  getResolvedAuth?: () => ResolvedGatewayAuth;
   /** Optional rate limiter for auth brute-force protection. */
   rateLimiter?: AuthRateLimiter;
+  getReadiness?: ReadinessChecker;
+  getRuntimeConfig?: () => OpenClawConfig;
+  isTerminalEnabled?: () => boolean;
   tlsOptions?: TlsOptions;
 }): HttpServer {
   const {
-    canvasHost,
     clients,
     controlUiEnabled,
     controlUiBasePath,
     controlUiRoot,
     openAiChatCompletionsEnabled,
+    openAiChatCompletionsConfig,
     openResponsesEnabled,
     openResponsesConfig,
     strictTransportSecurityHeader,
     handleHooksRequest,
     handlePluginRequest,
+    shouldEnforcePluginGatewayAuth,
+    resolvePluginNodeCapabilityRoute,
     resolvedAuth,
     rateLimiter,
+    getReadiness,
   } = opts;
+  const getResolvedAuth = opts.getResolvedAuth ?? (() => resolvedAuth);
+  const loadGatewayConfig = opts.getRuntimeConfig ?? getRuntimeConfig;
+  const openAiCompatEnabled = openAiChatCompletionsEnabled || openResponsesEnabled;
   const httpServer: HttpServer = opts.tlsOptions
     ? createHttpsServer(opts.tlsOptions, (req, res) => {
-        void handleRequest(req, res);
+        void handleRequestWithTrace(req, res);
       })
     : createHttpServer((req, res) => {
-        void handleRequest(req, res);
+        void handleRequestWithTrace(req, res);
       });
+
+  function handleRequestWithTrace(req: IncomingMessage, res: ServerResponse) {
+    return runWithDiagnosticTraceContext(createDiagnosticTraceContext(), () =>
+      handleRequest(req, res),
+    );
+  }
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     setDefaultSecurityHeaders(res, {
@@ -456,135 +519,369 @@ export function createGatewayHttpServer(opts: {
     });
 
     // Don't interfere with WebSocket upgrades; ws handles the 'upgrade' event.
-    if (String(req.headers.upgrade ?? "").toLowerCase() === "websocket") {
+    if ((req.headers.upgrade ?? "").toLowerCase() === "websocket") {
       return;
     }
 
     try {
-      const configSnapshot = loadConfig();
-      const trustedProxies = configSnapshot.gateway?.trustedProxies ?? [];
-      const allowRealIpFallback = configSnapshot.gateway?.allowRealIpFallback === true;
-      const scopedCanvas = normalizeCanvasScopedUrl(req.url ?? "/");
-      if (scopedCanvas.malformedScopedPath) {
+      const requestPath = parseGatewayRequestPath(req.url);
+      if (requestPath === undefined) {
         sendGatewayAuthFailure(res, { ok: false, reason: "unauthorized" });
         return;
       }
-      if (scopedCanvas.rewrittenUrl) {
-        req.url = scopedCanvas.rewrittenUrl;
-      }
-      const requestPath = new URL(req.url ?? "/", "http://localhost").pathname;
-      if (await handleHooksRequest(req, res)) {
+      if (GATEWAY_PROBE_STATUS_BY_PATH.get(requestPath) === "live") {
+        await handleGatewayProbeRequest(
+          req,
+          res,
+          requestPath,
+          getResolvedAuth(),
+          [],
+          false,
+          getReadiness,
+        );
         return;
       }
-      if (
-        await handleToolsInvokeHttpRequest(req, res, {
-          auth: resolvedAuth,
+
+      const configSnapshot = loadGatewayConfig();
+      const trustedProxies = configSnapshot.gateway?.trustedProxies ?? [];
+      const allowRealIpFallback = configSnapshot.gateway?.allowRealIpFallback === true;
+      const scopedNodeCapability = normalizePluginNodeCapabilityScopedUrl(req.url ?? "/");
+      if (scopedNodeCapability.malformedScopedPath) {
+        sendGatewayAuthFailure(res, { ok: false, reason: "unauthorized" });
+        return;
+      }
+      if (scopedNodeCapability.rewrittenUrl) {
+        // Scoped capability URLs are normalized before auth/routing so built-in handlers,
+        // plugin route matching, and audit context all see the same canonical path.
+        req.url = scopedNodeCapability.rewrittenUrl;
+      }
+      const scopedRequestPath = scopedNodeCapability.pathname;
+      const pluginPathContext = handlePluginRequest
+        ? resolvePluginRoutePathContext(scopedRequestPath)
+        : null;
+      const resolvedAuthValue = getResolvedAuth();
+      const handleControlUiRequest = async () =>
+        (await getControlUiModule()).handleControlUiHttpRequest(req, res, {
+          basePath: controlUiBasePath,
+          config: configSnapshot,
+          terminalEnabled:
+            opts.isTerminalEnabled?.() ?? configSnapshot.gateway?.terminal?.enabled === true,
+          agentId: resolveAssistantIdentity({ cfg: configSnapshot }).agentId,
+          root: controlUiRoot,
+          auth: resolvedAuthValue,
           trustedProxies,
           allowRealIpFallback,
           rateLimiter,
+        });
+      const requestStages: GatewayHttpRequestStage[] = [
+        {
+          name: "gateway-probes",
+          run: () =>
+            handleGatewayProbeRequest(
+              req,
+              res,
+              scopedRequestPath,
+              resolvedAuthValue,
+              trustedProxies,
+              allowRealIpFallback,
+              getReadiness,
+            ),
+        },
+        {
+          name: "hooks",
+          run: () => handleHooksRequest(req, res),
+        },
+      ];
+      if (opts.handleWatchNodeRequest && scopedRequestPath.startsWith("/api/nodes/watch/")) {
+        requestStages.push({
+          name: "watch-node",
+          run: () =>
+            runWithGatewayHttpWorkAdmission(
+              res,
+              () => opts.handleWatchNodeRequest?.(req, res) ?? false,
+            ),
+        });
+      }
+      if (openAiCompatEnabled && isOpenAiModelsPath(scopedRequestPath)) {
+        requestStages.push({
+          name: "models",
+          run: async () =>
+            await runWithGatewayHttpWorkAdmission(res, async () =>
+              (await getModelsHttpModule()).handleOpenAiModelsHttpRequest(req, res, {
+                auth: resolvedAuthValue,
+                trustedProxies,
+                allowRealIpFallback,
+                rateLimiter,
+              }),
+            ),
+        });
+      }
+      if (openAiCompatEnabled && isEmbeddingsPath(scopedRequestPath)) {
+        requestStages.push({
+          name: "embeddings",
+          run: async () =>
+            await runWithGatewayHttpWorkAdmission(res, async () =>
+              (await getEmbeddingsHttpModule()).handleOpenAiEmbeddingsHttpRequest(req, res, {
+                auth: resolvedAuthValue,
+                trustedProxies,
+                allowRealIpFallback,
+                rateLimiter,
+              }),
+            ),
+        });
+      }
+      if (isToolsInvokePath(scopedRequestPath)) {
+        requestStages.push({
+          name: "tools-invoke",
+          run: async () =>
+            await runWithGatewayHttpWorkAdmission(res, async () =>
+              (await getToolsInvokeHttpModule()).handleToolsInvokeHttpRequest(req, res, {
+                auth: resolvedAuthValue,
+                trustedProxies,
+                allowRealIpFallback,
+                rateLimiter,
+              }),
+            ),
+        });
+      }
+      if (isSessionKillPath(scopedRequestPath)) {
+        requestStages.push({
+          name: "sessions-kill",
+          run: async () =>
+            await runWithGatewayHttpWorkAdmission(res, async () =>
+              (await getSessionKillHttpModule()).handleSessionKillHttpRequest(req, res, {
+                auth: resolvedAuthValue,
+                trustedProxies,
+                allowRealIpFallback,
+                rateLimiter,
+              }),
+            ),
+        });
+      }
+      if (isSessionHistoryPath(scopedRequestPath)) {
+        requestStages.push({
+          name: "sessions-history",
+          run: async () =>
+            await runWithGatewayHttpWorkAdmission(res, async () =>
+              (await getSessionHistoryHttpModule()).handleSessionHistoryHttpRequest(req, res, {
+                auth: resolvedAuthValue,
+                getResolvedAuth,
+                trustedProxies,
+                allowRealIpFallback,
+                rateLimiter,
+              }),
+            ),
+        });
+      }
+      if (openResponsesEnabled && isOpenResponsesPath(scopedRequestPath)) {
+        requestStages.push({
+          name: "openresponses",
+          run: async () =>
+            await runWithGatewayHttpWorkAdmission(res, async () =>
+              (await getOpenResponsesHttpModule()).handleOpenResponsesHttpRequest(req, res, {
+                auth: resolvedAuthValue,
+                config: openResponsesConfig,
+                trustedProxies,
+                allowRealIpFallback,
+                rateLimiter,
+              }),
+            ),
+        });
+      }
+      if (openAiChatCompletionsEnabled && isOpenAiChatCompletionsPath(scopedRequestPath)) {
+        requestStages.push({
+          name: "openai",
+          run: async () =>
+            await runWithGatewayHttpWorkAdmission(res, async () =>
+              (await getOpenAiHttpModule()).handleOpenAiHttpRequest(req, res, {
+                auth: resolvedAuthValue,
+                config: openAiChatCompletionsConfig,
+                trustedProxies,
+                allowRealIpFallback,
+                rateLimiter,
+              }),
+            ),
+        });
+      }
+      if (
+        isControlUiApprovalDocumentPath({
+          basePath: controlUiBasePath,
+          pathname: scopedRequestPath,
         })
       ) {
-        return;
+        requestStages.push({
+          name: "control-ui-approval-document",
+          run: async () => {
+            if (!controlUiEnabled) {
+              res.statusCode = 404;
+              res.setHeader("Content-Type", "text/plain; charset=utf-8");
+              res.end("Not Found");
+              return true;
+            }
+            const handled = await handleControlUiRequest();
+            if (handled) {
+              return true;
+            }
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "text/plain; charset=utf-8");
+            res.end("Not Found");
+            return true;
+          },
+        });
       }
-      if (await handleSlackHttpRequest(req, res)) {
-        return;
+      if (
+        handlePluginRequest &&
+        pluginPathContext &&
+        resolvePluginNodeCapabilityRoute?.(pluginPathContext)
+      ) {
+        const nodeCapability = resolvePluginNodeCapabilityRoute(pluginPathContext);
+        requestStages.push({
+          name: "plugin-node-capability-auth",
+          run: async () => {
+            if (!nodeCapability) {
+              return false;
+            }
+            const { authorizePluginNodeCapabilityRequest } =
+              await getPluginNodeCapabilityAuthModule();
+            const ok = await authorizePluginNodeCapabilityRequest({
+              req,
+              auth: resolvedAuthValue,
+              trustedProxies,
+              allowRealIpFallback,
+              clients,
+              nodeCapability,
+              capability: scopedNodeCapability.capability,
+              malformedScopedPath: scopedNodeCapability.malformedScopedPath,
+              rateLimiter,
+            });
+            if (!ok.ok) {
+              sendGatewayAuthFailure(res, ok);
+              return true;
+            }
+            return false;
+          },
+        });
       }
-      if (handlePluginRequest) {
-        // Channel HTTP endpoints are gateway-auth protected by default.
-        // Non-channel plugin routes remain plugin-owned and must enforce
-        // their own auth when exposing sensitive functionality.
-        if (requestPath === "/api/channels" || requestPath.startsWith("/api/channels/")) {
-          const token = getBearerToken(req);
-          const authResult = await authorizeHttpGatewayConnect({
-            auth: resolvedAuth,
-            connectAuth: token ? { token, password: token } : null,
-            req,
-            trustedProxies,
-            allowRealIpFallback,
-            rateLimiter,
-          });
-          if (!authResult.ok) {
-            sendGatewayAuthFailure(res, authResult);
-            return;
-          }
-        }
-        if (await handlePluginRequest(req, res)) {
-          return;
-        }
+      if (
+        controlUiEnabled &&
+        isControlUiPluginManagerRequest({
+          basePath: controlUiBasePath,
+          pathname: scopedRequestPath,
+          method: req.method,
+        })
+      ) {
+        // This page must remain reachable when a plugin route is broken so the
+        // operator can disable it. Other explicit plugin routes retain precedence.
+        requestStages.push({
+          name: "control-ui-plugin-manager",
+          run: async () =>
+            (await getControlUiModule()).handleControlUiHttpRequest(req, res, {
+              basePath: controlUiBasePath,
+              config: configSnapshot,
+              terminalEnabled:
+                opts.isTerminalEnabled?.() ?? configSnapshot.gateway?.terminal?.enabled === true,
+              agentId: resolveAssistantIdentity({ cfg: configSnapshot }).agentId,
+              root: controlUiRoot,
+              auth: resolvedAuthValue,
+              trustedProxies,
+              allowRealIpFallback,
+              rateLimiter,
+            }),
+        });
       }
-      if (openResponsesEnabled) {
-        if (
-          await handleOpenResponsesHttpRequest(req, res, {
-            auth: resolvedAuth,
-            config: openResponsesConfig,
-            trustedProxies,
-            allowRealIpFallback,
-            rateLimiter,
-          })
-        ) {
-          return;
-        }
+      // Plugin routes run before the general Control UI SPA catch-all so
+      // explicitly registered endpoints stay reachable. Core routes and the
+      // plugin recovery surface staged above keep precedence.
+      requestStages.push(
+        ...buildPluginRequestStages({
+          req,
+          res,
+          requestPath: scopedRequestPath,
+          getGatewayAuthBypassPaths: () => getCachedPluginGatewayAuthBypassPaths(configSnapshot),
+          pluginPathContext,
+          handlePluginRequest,
+          shouldEnforcePluginGatewayAuth,
+          resolvedAuth: resolvedAuthValue,
+          trustedProxies,
+          allowRealIpFallback,
+          rateLimiter,
+        }),
+      );
+
+      if (isManagedOutgoingImagePath(scopedRequestPath)) {
+        requestStages.push({
+          name: "chat-managed-image-media",
+          run: async () =>
+            (await getManagedImageAttachmentsModule()).handleManagedOutgoingImageHttpRequest(
+              req,
+              res,
+              {
+                auth: resolvedAuthValue,
+                trustedProxies,
+                allowRealIpFallback,
+                rateLimiter,
+              },
+            ),
+        });
       }
-      if (openAiChatCompletionsEnabled) {
-        if (
-          await handleOpenAiHttpRequest(req, res, {
-            auth: resolvedAuth,
-            trustedProxies,
-            allowRealIpFallback,
-            rateLimiter,
-          })
-        ) {
-          return;
-        }
-      }
-      if (canvasHost) {
-        if (isCanvasPath(requestPath)) {
-          const ok = await authorizeCanvasRequest({
-            req,
-            auth: resolvedAuth,
-            trustedProxies,
-            allowRealIpFallback,
-            clients,
-            canvasCapability: scopedCanvas.capability,
-            malformedScopedPath: scopedCanvas.malformedScopedPath,
-            rateLimiter,
-          });
-          if (!ok.ok) {
-            sendGatewayAuthFailure(res, ok);
-            return;
-          }
-        }
-        if (await handleA2uiHttpRequest(req, res)) {
-          return;
-        }
-        if (await canvasHost.handleHttpRequest(req, res)) {
-          return;
-        }
+
+      if (controlUiEnabled && isControlUiCatalogIconRequest(scopedRequestPath, controlUiBasePath)) {
+        requestStages.push({
+          name: "control-ui-catalog-icon",
+          run: async () =>
+            (await getPluginIconHttpModule()).handlePluginIconHttpRequest(req, res, {
+              basePath: controlUiBasePath,
+              config: configSnapshot,
+              auth: resolvedAuthValue,
+              trustedProxies,
+              allowRealIpFallback,
+              rateLimiter,
+            }),
+        });
       }
       if (controlUiEnabled) {
-        if (
-          handleControlUiAvatarRequest(req, res, {
-            basePath: controlUiBasePath,
-            resolveAvatar: (agentId) => resolveAgentAvatar(configSnapshot, agentId),
-          })
-        ) {
-          return;
-        }
-        if (
-          handleControlUiHttpRequest(req, res, {
-            basePath: controlUiBasePath,
-            config: configSnapshot,
-            root: controlUiRoot,
-          })
-        ) {
-          return;
-        }
+        requestStages.push({
+          name: "control-ui-assistant-media",
+          run: async () =>
+            (await getControlUiModule()).handleControlUiAssistantMediaRequest(req, res, {
+              basePath: controlUiBasePath,
+              config: configSnapshot,
+              agentId: resolveAssistantIdentity({ cfg: configSnapshot }).agentId,
+              auth: resolvedAuthValue,
+              trustedProxies,
+              allowRealIpFallback,
+              rateLimiter,
+            }),
+        });
+        requestStages.push({
+          name: "control-ui-avatar",
+          run: async () => {
+            const { handleControlUiAvatarRequest } = await getControlUiModule();
+            return handleControlUiAvatarRequest(req, res, {
+              basePath: controlUiBasePath,
+              config: configSnapshot,
+              auth: resolvedAuthValue,
+              trustedProxies,
+              allowRealIpFallback,
+              rateLimiter,
+            });
+          },
+        });
+        requestStages.push({
+          name: "control-ui-http",
+          run: handleControlUiRequest,
+        });
+      }
+
+      if (await runGatewayHttpRequestStages(requestStages)) {
+        return;
       }
 
       res.statusCode = 404;
       res.setHeader("Content-Type", "text/plain; charset=utf-8");
       res.end("Not Found");
-    } catch {
+    } catch (err) {
+      console.error("[gateway-http] unhandled error in request handler:", err);
       res.statusCode = 500;
       res.setHeader("Content-Type", "text/plain; charset=utf-8");
       res.end("Internal Server Error");
@@ -594,58 +891,238 @@ export function createGatewayHttpServer(opts: {
   return httpServer;
 }
 
+/** Attaches WebSocket and plugin-upgrade routing to an already-created HTTP server. */
 export function attachGatewayUpgradeHandler(opts: {
   httpServer: HttpServer;
   wss: WebSocketServer;
-  canvasHost: CanvasHostHandler | null;
+  handlePluginUpgrade?: PluginHttpUpgradeHandler;
+  shouldEnforcePluginGatewayAuth?: (pathContext: PluginRoutePathContext) => boolean;
+  resolvePluginNodeCapabilityRoute?: ResolvePluginNodeCapabilityRoute;
   clients: Set<GatewayWsClient>;
+  preauthConnectionBudget: PreauthConnectionBudget;
   resolvedAuth: ResolvedGatewayAuth;
+  getResolvedAuth?: () => ResolvedGatewayAuth;
   /** Optional rate limiter for auth brute-force protection. */
   rateLimiter?: AuthRateLimiter;
+  /** Optional logger for error diagnostics. */
+  log?: { warn: (msg: string) => void };
 }) {
-  const { httpServer, wss, canvasHost, clients, resolvedAuth, rateLimiter } = opts;
+  const {
+    httpServer,
+    wss,
+    handlePluginUpgrade,
+    shouldEnforcePluginGatewayAuth,
+    resolvePluginNodeCapabilityRoute,
+    clients,
+    preauthConnectionBudget,
+    resolvedAuth,
+    rateLimiter,
+    log,
+  } = opts;
+  const getResolvedAuth = opts.getResolvedAuth ?? (() => resolvedAuth);
   httpServer.on("upgrade", (req, socket, head) => {
-    void (async () => {
-      const scopedCanvas = normalizeCanvasScopedUrl(req.url ?? "/");
-      if (scopedCanvas.malformedScopedPath) {
+    void runWithDiagnosticTraceContext(createDiagnosticTraceContext(), async () => {
+      const configSnapshot = getRuntimeConfig();
+      const trustedProxies = configSnapshot.gateway?.trustedProxies ?? [];
+      const allowRealIpFallback = configSnapshot.gateway?.allowRealIpFallback === true;
+      const requestClientIp = resolveRequestClientIp(req, trustedProxies, allowRealIpFallback);
+      const scopedNodeCapability = normalizePluginNodeCapabilityScopedUrl(req.url ?? "/");
+      if (scopedNodeCapability.malformedScopedPath) {
         writeUpgradeAuthFailure(socket, { ok: false, reason: "unauthorized" });
         socket.destroy();
         return;
       }
-      if (scopedCanvas.rewrittenUrl) {
-        req.url = scopedCanvas.rewrittenUrl;
+      if (scopedNodeCapability.rewrittenUrl) {
+        req.url = scopedNodeCapability.rewrittenUrl;
       }
-      if (canvasHost) {
-        const url = new URL(req.url ?? "/", "http://localhost");
-        if (url.pathname === CANVAS_WS_PATH) {
-          const configSnapshot = loadConfig();
-          const trustedProxies = configSnapshot.gateway?.trustedProxies ?? [];
-          const allowRealIpFallback = configSnapshot.gateway?.allowRealIpFallback === true;
-          const ok = await authorizeCanvasRequest({
-            req,
-            auth: resolvedAuth,
-            trustedProxies,
-            allowRealIpFallback,
-            clients,
-            canvasCapability: scopedCanvas.capability,
-            malformedScopedPath: scopedCanvas.malformedScopedPath,
-            rateLimiter,
-          });
-          if (!ok.ok) {
-            writeUpgradeAuthFailure(socket, ok);
-            socket.destroy();
-            return;
-          }
-        }
-        if (canvasHost.handleUpgrade(req, socket, head)) {
+      const resolvedAuthLocal = getResolvedAuth();
+      const requestPath = scopedNodeCapability.pathname;
+      const pathContext = resolvePluginRoutePathContext(requestPath);
+      const nodeCapability = resolvePluginNodeCapabilityRoute?.(pathContext);
+      if (nodeCapability) {
+        // Node-capability WebSocket upgrades authenticate before plugin upgrade dispatch so
+        // plugin handlers never receive unauthorized scoped capability sockets.
+        const { authorizePluginNodeCapabilityRequest } = await getPluginNodeCapabilityAuthModule();
+        const ok = await authorizePluginNodeCapabilityRequest({
+          req,
+          auth: resolvedAuthLocal,
+          trustedProxies,
+          allowRealIpFallback,
+          clients,
+          nodeCapability,
+          capability: scopedNodeCapability.capability,
+          malformedScopedPath: scopedNodeCapability.malformedScopedPath,
+          rateLimiter,
+        });
+        if (!ok.ok) {
+          writeUpgradeAuthFailure(socket, ok);
+          socket.destroy();
           return;
         }
       }
-      wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit("connection", ws, req);
-      });
-    })().catch(() => {
+      if (handlePluginUpgrade) {
+        let pluginGatewayAuthSatisfied = false;
+        let pluginGatewayRequestAuth: AuthorizedGatewayHttpRequest | undefined;
+        let pluginGatewayRequestOperatorScopes: string[] | undefined;
+        const enforcePluginGatewayAuth = (
+          shouldEnforcePluginGatewayAuth ?? shouldEnforceDefaultPluginGatewayAuth
+        )(pathContext);
+        if (
+          enforcePluginGatewayAuth &&
+          !(await getCachedPluginGatewayAuthBypassPaths(configSnapshot)).has(requestPath)
+        ) {
+          const { checkGatewayHttpRequestAuth } = await getHttpAuthUtilsModule();
+          const authCheck = await checkGatewayHttpRequestAuth({
+            req,
+            auth: resolvedAuthLocal,
+            trustedProxies,
+            allowRealIpFallback,
+            rateLimiter,
+            cfg: configSnapshot,
+          });
+          if (!authCheck.ok) {
+            writeUpgradeAuthFailure(socket, authCheck.authResult);
+            socket.destroy();
+            return;
+          }
+          pluginGatewayAuthSatisfied = true;
+          pluginGatewayRequestAuth = authCheck.requestAuth;
+          const { resolvePluginRouteRuntimeOperatorScopes } =
+            await getPluginRouteRuntimeScopesModule();
+          pluginGatewayRequestOperatorScopes = resolvePluginRouteRuntimeOperatorScopes(
+            req,
+            authCheck.requestAuth,
+          );
+        }
+        if (
+          await handlePluginUpgrade(req, socket, head, pathContext, {
+            gatewayAuthSatisfied: pluginGatewayAuthSatisfied,
+            gatewayRequestAuth: pluginGatewayRequestAuth,
+            gatewayRequestOperatorScopes: pluginGatewayRequestOperatorScopes,
+            gatewayRequestClientIp: requestClientIp,
+          })
+        ) {
+          return;
+        }
+      }
+      // Plugin-owned upgrade routes have already had the opportunity to claim the socket.
+      // Core Gateway upgrades must stop at the HTTP boundary so a client cannot hold an
+      // untracked pre-connect socket after suspension or restart admission closes.
+      if (isGatewayWorkAdmissionClosed()) {
+        writeGatewayUpgradeServiceUnavailable(socket, "Gateway websocket admission closed");
+        socket.destroy();
+        return;
+      }
+      const preauthBudgetKey = requestClientIp;
+      if (wss.listenerCount("connection") === 0) {
+        writeGatewayUpgradeServiceUnavailable(socket, "Gateway websocket handlers unavailable");
+        socket.destroy();
+        return;
+      }
+      if (!preauthConnectionBudget.acquire(preauthBudgetKey)) {
+        writeGatewayUpgradeServiceUnavailable(socket, "Too many unauthenticated sockets");
+        socket.destroy();
+        return;
+      }
+      let budgetTransferred = false;
+      // The socket owns the preauth budget until the WebSocket connection handler claims it;
+      // close/error paths release here to avoid leaking unauthenticated connection slots.
+      const releaseUpgradeBudget = () => {
+        if (budgetTransferred) {
+          return;
+        }
+        budgetTransferred = true;
+        preauthConnectionBudget.release(preauthBudgetKey);
+      };
+      socket.once("close", releaseUpgradeBudget);
+      try {
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          (
+            ws as unknown as import("ws").WebSocket & {
+              __openclawPreauthBudgetClaimed?: boolean;
+              __openclawPreauthBudgetKey?: string;
+            }
+          )["__openclawPreauthBudgetKey"] = preauthBudgetKey;
+          wss.emit("connection", ws, req);
+          const budgetClaimed = Boolean(
+            (
+              ws as unknown as import("ws").WebSocket & {
+                __openclawPreauthBudgetClaimed?: boolean;
+              }
+            )["__openclawPreauthBudgetClaimed"],
+          );
+          if (budgetClaimed) {
+            budgetTransferred = true;
+            socket.off("close", releaseUpgradeBudget);
+          }
+        });
+      } catch {
+        socket.off("close", releaseUpgradeBudget);
+        releaseUpgradeBudget();
+        throw new Error("gateway websocket upgrade failed");
+      }
+    }).catch((err: unknown) => {
+      const remoteAddress = (socket as { remoteAddress?: string }).remoteAddress ?? "unknown";
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log?.warn(`ws upgrade error from ${remoteAddress}: ${errorMessage}`);
       socket.destroy();
     });
   });
 }
+
+/** Attach the loopback-only worker ingress and force every accepted socket into worker mode. */
+export function attachWorkerGatewayUpgradeHandler(params: {
+  httpServer: HttpServer;
+  wss: WebSocketServer;
+  preauthConnectionBudget: PreauthConnectionBudget;
+  log?: { warn: (message: string) => void };
+}): void {
+  params.httpServer.on("upgrade", (req, socket, head) => {
+    if (isGatewayWorkAdmissionClosed()) {
+      writeGatewayUpgradeServiceUnavailable(socket, "Worker websocket admission closed");
+      socket.destroy();
+      return;
+    }
+    const preauthBudgetKey = req.socket.remoteAddress;
+    if (params.wss.listenerCount("connection") === 0) {
+      writeGatewayUpgradeServiceUnavailable(socket, "Worker websocket handlers unavailable");
+      socket.destroy();
+      return;
+    }
+    if (!params.preauthConnectionBudget.acquire(preauthBudgetKey)) {
+      writeGatewayUpgradeServiceUnavailable(socket, "Too many unauthenticated sockets");
+      socket.destroy();
+      return;
+    }
+    let budgetTransferred = false;
+    const releaseUpgradeBudget = () => {
+      if (budgetTransferred) {
+        return;
+      }
+      budgetTransferred = true;
+      params.preauthConnectionBudget.release(preauthBudgetKey);
+    };
+    socket.once("close", releaseUpgradeBudget);
+    try {
+      params.wss.handleUpgrade(req, socket, head, (ws) => {
+        const workerSocket = ws as GatewayIngressWebSocket;
+        workerSocket[GATEWAY_WS_CONNECTION_KIND_PROPERTY] = "worker";
+        workerSocket[GATEWAY_WS_PREAUTH_BUDGET_PROPERTY] = params.preauthConnectionBudget;
+        workerSocket["__openclawPreauthBudgetKey"] = preauthBudgetKey;
+        params.wss.emit("connection", ws, req);
+        if (workerSocket["__openclawPreauthBudgetClaimed"]) {
+          budgetTransferred = true;
+          socket.off("close", releaseUpgradeBudget);
+        }
+      });
+    } catch (error) {
+      socket.off("close", releaseUpgradeBudget);
+      releaseUpgradeBudget();
+      params.log?.warn(
+        `worker websocket upgrade failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      socket.destroy();
+    }
+  });
+}
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

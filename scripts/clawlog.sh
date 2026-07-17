@@ -44,6 +44,7 @@ SERVER_ONLY=false
 TAIL_LINES=50  # Default number of lines to show
 SHOW_TAIL=true
 SHOW_HELP=false
+STYLE_JSON=false
 
 # Function to show usage
 show_usage() {
@@ -137,11 +138,13 @@ list_categories() {
     echo -e "\n${YELLOW}Note: Only categories with recent activity are shown${NC}"
 }
 
-# Show help if no arguments provided
-if [[ $# -eq 0 ]]; then
-    show_usage
-    exit 0
-fi
+# Escape user input embedded in macOS log predicate string literals.
+escape_predicate_literal() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '%s' "$value"
+}
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -156,14 +159,26 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -n|--lines)
+            if [[ $# -lt 2 ]]; then
+                echo -e "${RED}Error: $1 requires a value${NC}" >&2
+                exit 1
+            fi
             TAIL_LINES="$2"
             shift 2
             ;;
         -l|--last)
+            if [[ $# -lt 2 ]]; then
+                echo -e "${RED}Error: $1 requires a value${NC}" >&2
+                exit 1
+            fi
             TIME_RANGE="$2"
             shift 2
             ;;
         -c|--category)
+            if [[ $# -lt 2 ]]; then
+                echo -e "${RED}Error: $1 requires a value${NC}" >&2
+                exit 1
+            fi
             CATEGORY="$2"
             shift 2
             ;;
@@ -176,10 +191,18 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -s|--search)
+            if [[ $# -lt 2 ]]; then
+                echo -e "${RED}Error: $1 requires a value${NC}" >&2
+                exit 1
+            fi
             SEARCH_TEXT="$2"
             shift 2
             ;;
         -o|--output)
+            if [[ $# -lt 2 ]]; then
+                echo -e "${RED}Error: $1 requires a value${NC}" >&2
+                exit 1
+            fi
             OUTPUT_FILE="$2"
             shift 2
             ;;
@@ -193,7 +216,7 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         --json)
-            STYLE_ARGS="--style json"
+            STYLE_JSON=true
             shift
             ;;
         --all)
@@ -213,7 +236,8 @@ PREDICATE="subsystem == \"$SUBSYSTEM\""
 
 # Add category filter if specified
 if [[ -n "$CATEGORY" ]]; then
-    PREDICATE="$PREDICATE AND category == \"$CATEGORY\""
+    ESCAPED_CATEGORY=$(escape_predicate_literal "$CATEGORY")
+    PREDICATE="$PREDICATE AND category == \"$ESCAPED_CATEGORY\""
 fi
 
 # Add error filter if specified
@@ -223,29 +247,31 @@ fi
 
 # Add search filter if specified
 if [[ -n "$SEARCH_TEXT" ]]; then
-    PREDICATE="$PREDICATE AND eventMessage CONTAINS[c] \"$SEARCH_TEXT\""
+    ESCAPED_SEARCH_TEXT=$(escape_predicate_literal "$SEARCH_TEXT")
+    PREDICATE="$PREDICATE AND eventMessage CONTAINS[c] \"$ESCAPED_SEARCH_TEXT\""
 fi
 
-# Build the command - always use sudo with --info to show private data
+# Build the command as argv array to avoid shell eval injection
+LOG_CMD=(sudo log)
 if [[ "$STREAM_MODE" == true ]]; then
     # Streaming mode
-    CMD="sudo log stream --predicate '$PREDICATE' --level $LOG_LEVEL --info"
+    LOG_CMD+=(stream --predicate "$PREDICATE" --level "$LOG_LEVEL" --info)
 
     echo -e "${GREEN}Streaming VibeTunnel logs continuously...${NC}"
     echo -e "${YELLOW}Press Ctrl+C to stop${NC}\n"
 else
     # Show mode
-    CMD="sudo log show --predicate '$PREDICATE'"
+    LOG_CMD+=(show --predicate "$PREDICATE")
 
     # Add log level for show command
     if [[ "$LOG_LEVEL" == "debug" ]]; then
-        CMD="$CMD --debug"
+        LOG_CMD+=(--debug)
     else
-        CMD="$CMD --info"
+        LOG_CMD+=(--info)
     fi
 
     # Add time range
-    CMD="$CMD --last $TIME_RANGE"
+    LOG_CMD+=(--last "$TIME_RANGE")
 
     if [[ "$SHOW_TAIL" == true ]]; then
         echo -e "${GREEN}Showing last $TAIL_LINES log lines from the past $TIME_RANGE${NC}"
@@ -267,8 +293,8 @@ else
 fi
 
 # Add style arguments if specified
-if [[ -n "${STYLE_ARGS:-}" ]]; then
-    CMD="$CMD $STYLE_ARGS"
+if [[ "$STYLE_JSON" == true ]]; then
+    LOG_CMD+=(--style json)
 fi
 
 # Execute the command
@@ -280,9 +306,9 @@ if [[ -n "$OUTPUT_FILE" ]]; then
 
     echo -e "${BLUE}Exporting logs to: $OUTPUT_FILE${NC}\n"
     if [[ "$SHOW_TAIL" == true ]] && [[ "$STREAM_MODE" == false ]]; then
-        eval "$CMD" 2>&1 | tail -n "$TAIL_LINES" > "$OUTPUT_FILE"
+        "${LOG_CMD[@]}" 2>&1 | tail -n "$TAIL_LINES" > "$OUTPUT_FILE"
     else
-        eval "$CMD" > "$OUTPUT_FILE" 2>&1
+        "${LOG_CMD[@]}" > "$OUTPUT_FILE" 2>&1
     fi
 
     # Check if file was created and has content
@@ -301,9 +327,9 @@ else
 
     if [[ "$SHOW_TAIL" == true ]] && [[ "$STREAM_MODE" == false ]]; then
         # Apply tail for non-streaming mode
-        eval "$CMD" 2>&1 | tail -n "$TAIL_LINES"
+        "${LOG_CMD[@]}" 2>&1 | tail -n "$TAIL_LINES"
         echo -e "\n${YELLOW}Showing last $TAIL_LINES lines. Use --all or -n to see more.${NC}"
     else
-        eval "$CMD"
+        "${LOG_CMD[@]}"
     fi
 fi

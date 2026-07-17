@@ -1,982 +1,1594 @@
-import fs from "node:fs";
-import path from "node:path";
-import { CURRENT_SESSION_VERSION } from "@mariozechner/pi-coding-agent";
-import { resolveSessionAgentId } from "../../agents/agent-scope.js";
-import { resolveThinkingDefault } from "../../agents/model-selection.js";
-import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
-import { dispatchInboundMessage } from "../../auto-reply/dispatch.js";
-import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
-import type { MsgContext } from "../../auto-reply/templating.js";
-import { createReplyPrefixOptions } from "../../channels/reply-prefix.js";
-import { resolveSessionFilePath } from "../../config/sessions.js";
-import { resolveSendPolicy } from "../../sessions/send-policy.js";
+// Chat gateway methods implement chat.send/history/abort/inject/metadata and
+// bridge UI RPCs to agent dispatch, transcripts, media, and streaming state.
+import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import {
-  stripInlineDirectiveTagsForDisplay,
-  stripInlineDirectiveTagsFromMessageForDisplay,
-} from "../../utils/directive-tags.js";
-import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
-import {
-  abortChatRunById,
-  abortChatRunsForSessionKey,
-  type ChatAbortControllerEntry,
-  type ChatAbortOps,
-  isChatStopCommandText,
-  resolveChatRunExpiresAtMs,
-} from "../chat-abort.js";
-import { type ChatImageContent, parseMessageWithAttachments } from "../chat-attachments.js";
-import { stripEnvelopeFromMessage, stripEnvelopeFromMessages } from "../chat-sanitize.js";
-import { GATEWAY_CLIENT_CAPS, hasGatewayClientCap } from "../protocol/client-info.js";
+  GATEWAY_CLIENT_CAPS,
+  hasGatewayClientCap,
+} from "../../../packages/gateway-protocol/src/client-info.js";
 import {
   ErrorCodes,
   errorShape,
   formatValidationErrors,
-  validateChatAbortParams,
   validateChatHistoryParams,
   validateChatInjectParams,
-  validateChatSendParams,
-} from "../protocol/index.js";
-import { getMaxChatHistoryMessagesBytes } from "../server-constants.js";
+  validateChatMetadataParams,
+  validateChatMessageGetParams,
+  validateChatToolTitlesParams,
+} from "../../../packages/gateway-protocol/src/index.js";
+import {
+  listAgentIds,
+  resolveDefaultAgentId,
+  resolveSessionAgentId,
+} from "../../agents/agent-scope.js";
+import { modelCatalogBrowseRequiresFullDiscovery } from "../../agents/model-catalog-browse.js";
+import type { ModelCatalogEntry, ModelCatalogSnapshot } from "../../agents/model-catalog.types.js";
+import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
+import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
+import { dispatchInboundMessage } from "../../auto-reply/dispatch.js";
+import { resolveSessionWorkStartError } from "../../config/sessions.js";
+import {
+  isSessionTranscriptProjectionUnavailableError,
+  resolveTranscriptSessionKeyBySessionId,
+} from "../../config/sessions/session-accessor.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import {
+  clearAgentRunContext,
+  getAgentEventLifecycleGeneration,
+} from "../../infra/agent-events.js";
+import {
+  emitDiagnosticsTimelineEvent,
+  measureDiagnosticsTimelineSpan,
+} from "../../infra/diagnostics-timeline.js";
+import { formatErrorMessage } from "../../infra/errors.js";
+import { jsonUtf8Bytes } from "../../infra/json-utf8-bytes.js";
+import {
+  retainGatewayRootWorkAdmissionContinuation,
+  runWithGatewayIndependentRootWorkContinuation,
+} from "../../process/gateway-work-admission.js";
+import { normalizeAgentId, scopeLegacySessionKeyToAgent } from "../../routing/session-key.js";
+import { beginSessionWorkAdmission } from "../../sessions/session-lifecycle-admission.js";
+import { stripInlineDirectiveTagsForDisplay } from "../../utils/directive-tags.js";
+import { isOperatorUiClient } from "../../utils/message-channel.js";
+import { listGatewayAgentsBasic } from "../agent-list.js";
+import {
+  boundInFlightRunSnapshotForChatHistory,
+  resolveInFlightRunSnapshot,
+  updateChatRunProvider,
+} from "../chat-abort.js";
+import {
+  augmentChatHistoryWithCanvasBlocks,
+  dropPreSessionStartAnnouncePairs,
+  projectChatDisplayMessage,
+  resolveEffectiveChatHistoryMaxChars,
+} from "../chat-display-projection.js";
+import {
+  completeQueuedChatTurn,
+  registerQueuedChatTurn,
+  retireQueuedChatTurnCancellation,
+} from "../chat-queued-turns.js";
+import {
+  isDashboardSessionTitleCandidate,
+  maybeGenerateDashboardSessionTitle,
+} from "../dashboard-session-title.js";
+import type { ChatRunTiming } from "../server-chat-state.js";
+import { getMaxChatHistoryMessagesBytes, MAX_PAYLOAD_BYTES } from "../server-constants.js";
 import {
   capArrayByJsonBytes,
+  readSessionMessageByIdAsync,
+  readSessionMessagesAsync,
+} from "../session-transcript-readers.js";
+import {
+  buildGatewaySessionInfo,
+  getSessionDefaults,
   loadSessionEntry,
-  readSessionMessages,
+  listAgentsForGateway,
   resolveSessionModelRef,
+  resolveSessionStoreKey,
 } from "../session-utils.js";
 import { formatForLog } from "../ws-log.js";
-import { injectTimestamp, timestampOptsFromConfig } from "./agent-timestamp.js";
-import { normalizeRpcAttachmentsToChatAttachments } from "./attachment-normalize.js";
-import { appendInjectedAssistantMessageToTranscript } from "./chat-transcript-inject.js";
-import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
+import { setGatewayDedupeEntry } from "./agent-job.js";
+import { handleChatAbortRequest } from "./chat-abort-handler.js";
+import { ensureChatQueuedTurns } from "./chat-abort-runtime.js";
+import { scheduleChatHistoryManagedImageCleanup } from "./chat-assistant-content.js";
+import {
+  broadcastChatError,
+  broadcastChatFinal,
+  sendGlobalAwareNodeChatPayload,
+} from "./chat-broadcast.js";
+import {
+  CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES,
+  enforceChatHistoryFinalBudget,
+  replaceOversizedChatHistoryMessages,
+  reportOmittedChatHistory,
+} from "./chat-history-budget.js";
+import {
+  capChatHistoryAroundMessage,
+  enrichChatHistoryCompactionMarkers,
+  readChatHistoryPage,
+  readChatHistoryMessageId,
+  readChatHistoryMessageSeq,
+} from "./chat-history-pages.js";
+import {
+  hasGatewayAdminScope,
+  resolveRequestedChatAgentId,
+  validateChatSelectedAgent,
+} from "./chat-origin-routing.js";
+import { terminalizeRestartSafeChatAdmission } from "./chat-restart-recovery.js";
+import { admitChatSend } from "./chat-send-admission.js";
+import { prepareChatSendAttachments } from "./chat-send-attachments.js";
+import { createChatSendDispatchErrorLifecycle } from "./chat-send-dispatch-errors.js";
+import { finalizeChatSendNonAgentReplies } from "./chat-send-nonagent-finalization.js";
+import {
+  respondChatSessionRoutingChanged,
+  runChatSendPreAdmission,
+} from "./chat-send-pre-admission.js";
+import { createChatSendReplyDispatch } from "./chat-send-reply-dispatch.js";
+import { normalizeChatSendRequest } from "./chat-send-request.js";
+import { prepareChatSendSession } from "./chat-send-session.js";
+import { finalizeChatSendSourceReplies } from "./chat-send-source-finalization.js";
+import { applyChatSendManagedMediaFields, prepareChatSendUserTurn } from "./chat-send-user-turn.js";
+import {
+  chatSendAckServerTimingAttributes,
+  emitOperatorChatSendServerTiming,
+  roundedChatSendTimingMs,
+  shouldIncludeChatSendAckServerTiming,
+  type ChatSendServerTimingPhase,
+} from "./chat-server-timing.js";
+import { normalizeOptionalChatText as normalizeOptionalText } from "./chat-text-normalization.js";
+import { appendAssistantTranscriptMessage } from "./chat-transcript-persistence.js";
+import { createGatewayChatUserTurnController } from "./chat-user-turn-recorder.js";
+import {
+  loadOptionalServerMethodModelCatalog,
+  loadOptionalServerMethodModelCatalogSnapshot,
+  startOptionalServerMethodModelCatalogSnapshotLoad,
+} from "./optional-model-catalog.js";
+import { resolveVisibleActiveSessionRunState } from "./session-active-runs.js";
+import { emitSessionsChanged } from "./session-change-event.js";
+import type {
+  GatewayRequestContext,
+  GatewayRequestHandlerOptions,
+  GatewayRequestHandlers,
+} from "./types.js";
 
-type TranscriptAppendResult = {
-  ok: boolean;
-  messageId?: string;
-  message?: Record<string, unknown>;
-  error?: string;
+type ChatHistoryMethod = "chat.history" | "chat.startup";
+
+type ChatMetadataResult = {
+  commands?: unknown[];
+  models?: unknown[];
 };
 
-type AbortOrigin = "rpc" | "stop-command";
-
-type AbortedPartialSnapshot = {
-  runId: string;
-  sessionId: string;
-  text: string;
-  abortOrigin: AbortOrigin;
-};
-
-const CHAT_HISTORY_TEXT_MAX_CHARS = 12_000;
-const CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES = 128 * 1024;
-const CHAT_HISTORY_OVERSIZED_PLACEHOLDER = "[chat.history omitted: message too large]";
-let chatHistoryPlaceholderEmitCount = 0;
-
-function stripDisallowedChatControlChars(message: string): string {
-  let output = "";
-  for (const char of message) {
-    const code = char.charCodeAt(0);
-    if (code === 9 || code === 10 || code === 13 || (code >= 32 && code !== 127)) {
-      output += char;
-    }
-  }
-  return output;
-}
-
-export function sanitizeChatSendMessageInput(
-  message: string,
-): { ok: true; message: string } | { ok: false; error: string } {
-  const normalized = message.normalize("NFC");
-  if (normalized.includes("\u0000")) {
-    return { ok: false, error: "message must not contain null bytes" };
-  }
-  return { ok: true, message: stripDisallowedChatControlChars(normalized) };
-}
-
-function truncateChatHistoryText(text: string): { text: string; truncated: boolean } {
-  if (text.length <= CHAT_HISTORY_TEXT_MAX_CHARS) {
-    return { text, truncated: false };
-  }
-  return {
-    text: `${text.slice(0, CHAT_HISTORY_TEXT_MAX_CHARS)}\n...(truncated)...`,
-    truncated: true,
-  };
-}
-
-function sanitizeChatHistoryContentBlock(block: unknown): { block: unknown; changed: boolean } {
-  if (!block || typeof block !== "object") {
-    return { block, changed: false };
-  }
-  const entry = { ...(block as Record<string, unknown>) };
-  let changed = false;
-  if (typeof entry.text === "string") {
-    const stripped = stripInlineDirectiveTagsForDisplay(entry.text);
-    const res = truncateChatHistoryText(stripped.text);
-    entry.text = res.text;
-    changed ||= stripped.changed || res.truncated;
-  }
-  if (typeof entry.partialJson === "string") {
-    const res = truncateChatHistoryText(entry.partialJson);
-    entry.partialJson = res.text;
-    changed ||= res.truncated;
-  }
-  if (typeof entry.arguments === "string") {
-    const res = truncateChatHistoryText(entry.arguments);
-    entry.arguments = res.text;
-    changed ||= res.truncated;
-  }
-  if (typeof entry.thinking === "string") {
-    const res = truncateChatHistoryText(entry.thinking);
-    entry.thinking = res.text;
-    changed ||= res.truncated;
-  }
-  if ("thinkingSignature" in entry) {
-    delete entry.thinkingSignature;
-    changed = true;
-  }
-  const type = typeof entry.type === "string" ? entry.type : "";
-  if (type === "image" && typeof entry.data === "string") {
-    const bytes = Buffer.byteLength(entry.data, "utf8");
-    delete entry.data;
-    entry.omitted = true;
-    entry.bytes = bytes;
-    changed = true;
-  }
-  return { block: changed ? entry : block, changed };
-}
-
-function sanitizeChatHistoryMessage(message: unknown): { message: unknown; changed: boolean } {
-  if (!message || typeof message !== "object") {
-    return { message, changed: false };
-  }
-  const entry = { ...(message as Record<string, unknown>) };
-  let changed = false;
-
-  if ("details" in entry) {
-    delete entry.details;
-    changed = true;
-  }
-  if ("usage" in entry) {
-    delete entry.usage;
-    changed = true;
-  }
-  if ("cost" in entry) {
-    delete entry.cost;
-    changed = true;
-  }
-
-  if (typeof entry.content === "string") {
-    const stripped = stripInlineDirectiveTagsForDisplay(entry.content);
-    const res = truncateChatHistoryText(stripped.text);
-    entry.content = res.text;
-    changed ||= stripped.changed || res.truncated;
-  } else if (Array.isArray(entry.content)) {
-    const updated = entry.content.map((block) => sanitizeChatHistoryContentBlock(block));
-    if (updated.some((item) => item.changed)) {
-      entry.content = updated.map((item) => item.block);
-      changed = true;
-    }
-  }
-
-  if (typeof entry.text === "string") {
-    const stripped = stripInlineDirectiveTagsForDisplay(entry.text);
-    const res = truncateChatHistoryText(stripped.text);
-    entry.text = res.text;
-    changed ||= stripped.changed || res.truncated;
-  }
-
-  return { message: changed ? entry : message, changed };
-}
-
-function sanitizeChatHistoryMessages(messages: unknown[]): unknown[] {
-  if (messages.length === 0) {
-    return messages;
-  }
-  let changed = false;
-  const next = messages.map((message) => {
-    const res = sanitizeChatHistoryMessage(message);
-    changed ||= res.changed;
-    return res.message;
-  });
-  return changed ? next : messages;
-}
-
-function jsonUtf8Bytes(value: unknown): number {
-  try {
-    return Buffer.byteLength(JSON.stringify(value), "utf8");
-  } catch {
-    return Buffer.byteLength(String(value), "utf8");
-  }
-}
-
-function buildOversizedHistoryPlaceholder(message?: unknown): Record<string, unknown> {
-  const role =
-    message &&
-    typeof message === "object" &&
-    typeof (message as { role?: unknown }).role === "string"
-      ? (message as { role: string }).role
-      : "assistant";
-  const timestamp =
-    message &&
-    typeof message === "object" &&
-    typeof (message as { timestamp?: unknown }).timestamp === "number"
-      ? (message as { timestamp: number }).timestamp
-      : Date.now();
-  return {
-    role,
-    timestamp,
-    content: [{ type: "text", text: CHAT_HISTORY_OVERSIZED_PLACEHOLDER }],
-    __openclaw: { truncated: true, reason: "oversized" },
-  };
-}
-
-function replaceOversizedChatHistoryMessages(params: {
-  messages: unknown[];
-  maxSingleMessageBytes: number;
-}): { messages: unknown[]; replacedCount: number } {
-  const { messages, maxSingleMessageBytes } = params;
-  if (messages.length === 0) {
-    return { messages, replacedCount: 0 };
-  }
-  let replacedCount = 0;
-  const next = messages.map((message) => {
-    if (jsonUtf8Bytes(message) <= maxSingleMessageBytes) {
-      return message;
-    }
-    replacedCount += 1;
-    return buildOversizedHistoryPlaceholder(message);
-  });
-  return { messages: replacedCount > 0 ? next : messages, replacedCount };
-}
-
-function enforceChatHistoryFinalBudget(params: { messages: unknown[]; maxBytes: number }): {
-  messages: unknown[];
-  placeholderCount: number;
-} {
-  const { messages, maxBytes } = params;
-  if (messages.length === 0) {
-    return { messages, placeholderCount: 0 };
-  }
-  if (jsonUtf8Bytes(messages) <= maxBytes) {
-    return { messages, placeholderCount: 0 };
-  }
-  const last = messages.at(-1);
-  if (last && jsonUtf8Bytes([last]) <= maxBytes) {
-    return { messages: [last], placeholderCount: 0 };
-  }
-  const placeholder = buildOversizedHistoryPlaceholder(last);
-  if (jsonUtf8Bytes([placeholder]) <= maxBytes) {
-    return { messages: [placeholder], placeholderCount: 1 };
-  }
-  return { messages: [], placeholderCount: 0 };
-}
-
-function resolveTranscriptPath(params: {
-  sessionId: string;
-  storePath: string | undefined;
-  sessionFile?: string;
-  agentId?: string;
-}): string | null {
-  const { sessionId, storePath, sessionFile, agentId } = params;
-  if (!storePath && !sessionFile) {
-    return null;
-  }
-  try {
-    const sessionsDir = storePath ? path.dirname(storePath) : undefined;
-    return resolveSessionFilePath(
-      sessionId,
-      sessionFile ? { sessionFile } : undefined,
-      sessionsDir || agentId ? { sessionsDir, agentId } : undefined,
+async function handleChatMetadataRequest({
+  params,
+  respond,
+  context,
+}: GatewayRequestHandlerOptions): Promise<void> {
+  if (!validateChatMetadataParams(params)) {
+    respond(
+      false,
+      undefined,
+      errorShape(
+        ErrorCodes.INVALID_REQUEST,
+        `invalid chat.metadata params: ${formatValidationErrors(validateChatMetadataParams.errors)}`,
+      ),
     );
-  } catch {
-    return null;
-  }
-}
-
-function ensureTranscriptFile(params: { transcriptPath: string; sessionId: string }): {
-  ok: boolean;
-  error?: string;
-} {
-  if (fs.existsSync(params.transcriptPath)) {
-    return { ok: true };
-  }
-  try {
-    fs.mkdirSync(path.dirname(params.transcriptPath), { recursive: true });
-    const header = {
-      type: "session",
-      version: CURRENT_SESSION_VERSION,
-      id: params.sessionId,
-      timestamp: new Date().toISOString(),
-      cwd: process.cwd(),
-    };
-    fs.writeFileSync(params.transcriptPath, `${JSON.stringify(header)}\n`, {
-      encoding: "utf-8",
-      mode: 0o600,
-    });
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
-  }
-}
-
-function transcriptHasIdempotencyKey(transcriptPath: string, idempotencyKey: string): boolean {
-  try {
-    const lines = fs.readFileSync(transcriptPath, "utf-8").split(/\r?\n/);
-    for (const line of lines) {
-      if (!line.trim()) {
-        continue;
-      }
-      const parsed = JSON.parse(line) as { message?: { idempotencyKey?: unknown } };
-      if (parsed?.message?.idempotencyKey === idempotencyKey) {
-        return true;
-      }
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-function appendAssistantTranscriptMessage(params: {
-  message: string;
-  label?: string;
-  sessionId: string;
-  storePath: string | undefined;
-  sessionFile?: string;
-  agentId?: string;
-  createIfMissing?: boolean;
-  idempotencyKey?: string;
-  abortMeta?: {
-    aborted: true;
-    origin: AbortOrigin;
-    runId: string;
-  };
-}): TranscriptAppendResult {
-  const transcriptPath = resolveTranscriptPath({
-    sessionId: params.sessionId,
-    storePath: params.storePath,
-    sessionFile: params.sessionFile,
-    agentId: params.agentId,
-  });
-  if (!transcriptPath) {
-    return { ok: false, error: "transcript path not resolved" };
-  }
-
-  if (!fs.existsSync(transcriptPath)) {
-    if (!params.createIfMissing) {
-      return { ok: false, error: "transcript file not found" };
-    }
-    const ensured = ensureTranscriptFile({
-      transcriptPath,
-      sessionId: params.sessionId,
-    });
-    if (!ensured.ok) {
-      return { ok: false, error: ensured.error ?? "failed to create transcript file" };
-    }
-  }
-
-  if (params.idempotencyKey && transcriptHasIdempotencyKey(transcriptPath, params.idempotencyKey)) {
-    return { ok: true };
-  }
-
-  return appendInjectedAssistantMessageToTranscript({
-    transcriptPath,
-    message: params.message,
-    label: params.label,
-    idempotencyKey: params.idempotencyKey,
-    abortMeta: params.abortMeta,
-  });
-}
-
-function collectSessionAbortPartials(params: {
-  chatAbortControllers: Map<string, ChatAbortControllerEntry>;
-  chatRunBuffers: Map<string, string>;
-  sessionKey: string;
-  abortOrigin: AbortOrigin;
-}): AbortedPartialSnapshot[] {
-  const out: AbortedPartialSnapshot[] = [];
-  for (const [runId, active] of params.chatAbortControllers) {
-    if (active.sessionKey !== params.sessionKey) {
-      continue;
-    }
-    const text = params.chatRunBuffers.get(runId);
-    if (!text || !text.trim()) {
-      continue;
-    }
-    out.push({
-      runId,
-      sessionId: active.sessionId,
-      text,
-      abortOrigin: params.abortOrigin,
-    });
-  }
-  return out;
-}
-
-function persistAbortedPartials(params: {
-  context: Pick<GatewayRequestContext, "logGateway">;
-  sessionKey: string;
-  snapshots: AbortedPartialSnapshot[];
-}) {
-  if (params.snapshots.length === 0) {
     return;
   }
-  const { storePath, entry } = loadSessionEntry(params.sessionKey);
-  for (const snapshot of params.snapshots) {
-    const sessionId = entry?.sessionId ?? snapshot.sessionId ?? snapshot.runId;
-    const appended = appendAssistantTranscriptMessage({
-      message: snapshot.text,
-      sessionId,
-      storePath,
-      sessionFile: entry?.sessionFile,
-      createIfMissing: true,
-      idempotencyKey: `${snapshot.runId}:assistant`,
-      abortMeta: {
-        aborted: true,
-        origin: snapshot.abortOrigin,
-        runId: snapshot.runId,
-      },
+  const metadataParams = params;
+  const cfg = context.getRuntimeConfig();
+  const requestedAgentId =
+    typeof metadataParams.agentId === "string" && metadataParams.agentId.trim()
+      ? normalizeAgentId(metadataParams.agentId)
+      : resolveDefaultAgentId(cfg);
+  if (!listAgentIds(cfg).includes(requestedAgentId)) {
+    respond(
+      false,
+      undefined,
+      errorShape(ErrorCodes.INVALID_REQUEST, `Unknown agent id "${metadataParams.agentId}"`),
+    );
+    return;
+  }
+  try {
+    respond(
+      true,
+      await buildChatMetadataResult({
+        cfg,
+        context,
+        agentId: requestedAgentId,
+      }),
+    );
+  } catch (err) {
+    respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, String(err)));
+  }
+}
+
+async function buildChatMetadataResult(params: {
+  cfg: OpenClawConfig;
+  context: GatewayRequestContext;
+  agentId: string;
+}): Promise<ChatMetadataResult> {
+  const [{ buildModelsListResult }, { buildCommandsListResult }] = await Promise.all([
+    import("./models-list-result.js"),
+    import("./commands-list-result.js"),
+  ]);
+  const [models, commands] = await Promise.all([
+    buildModelsListResult({
+      context: params.context,
+      agentId: params.agentId,
+      params: { view: "configured" },
+    }),
+    Promise.resolve(
+      buildCommandsListResult({
+        cfg: params.cfg,
+        agentId: params.agentId,
+        includeArgs: true,
+        scope: "text",
+      }),
+    ),
+  ]);
+  return { ...models, ...commands };
+}
+
+async function buildChatStartupMetadataResult(params: {
+  cfg: OpenClawConfig;
+  context: GatewayRequestContext;
+  agentId: string;
+  modelCatalog: ModelCatalogSnapshot | undefined;
+  catalogProjector?: ReturnType<
+    (typeof import("./models-list-result.js"))["createGatewayAgentModelCatalogProjector"]
+  >;
+}): Promise<ChatMetadataResult | undefined> {
+  if (!params.modelCatalog) {
+    return undefined;
+  }
+  if (modelCatalogBrowseRequiresFullDiscovery({ cfg: params.cfg, view: "configured" })) {
+    return undefined;
+  }
+  try {
+    const { buildModelsListResult } = await import("./models-list-result.js");
+    return await buildModelsListResult({
+      context: params.context,
+      agentId: params.agentId,
+      params: { view: "configured" },
+      preloadedCatalog: params.modelCatalog,
+      ...(params.catalogProjector ? { catalogProjector: params.catalogProjector } : {}),
     });
-    if (!appended.ok) {
-      params.context.logGateway.warn(
-        `chat.abort transcript append failed: ${appended.error ?? "unknown error"}`,
-      );
+  } catch (err) {
+    params.context.logGateway.debug(
+      `chat.startup continuing without metadata: ${formatErrorMessage(err)}`,
+    );
+    return undefined;
+  }
+}
+
+async function buildChatStartupModelCatalogProjection(params: {
+  cfg: OpenClawConfig;
+  snapshot: ModelCatalogSnapshot;
+  sessionAgentId: string;
+  sessionEntry: ReturnType<typeof loadSessionEntry>["entry"];
+  defaultAgentId: string;
+  includeAgentsList: boolean;
+}) {
+  const { createGatewayAgentModelCatalogProjector } = await import("./models-list-result.js");
+  const projectorByKey = new Map<
+    string,
+    ReturnType<typeof createGatewayAgentModelCatalogProjector>
+  >();
+  const modelCatalogByAgentId = new Map<string, ModelCatalogEntry[]>();
+  const getProjector = (
+    agentId: string,
+    profiles: { preferredProfileId?: string; lockedProfileId?: string } = {},
+  ) => {
+    const id = normalizeAgentId(agentId);
+    const key = `${id}\0${profiles.preferredProfileId ?? ""}\0${profiles.lockedProfileId ?? ""}`;
+    let projector = projectorByKey.get(key);
+    if (!projector) {
+      projector = createGatewayAgentModelCatalogProjector({
+        cfg: params.cfg,
+        agentId: id,
+        snapshot: params.snapshot,
+        ...(profiles.preferredProfileId ? { preferredProfileId: profiles.preferredProfileId } : {}),
+        ...(profiles.lockedProfileId ? { lockedProfileId: profiles.lockedProfileId } : {}),
+      });
+      projectorByKey.set(key, projector);
+    }
+    return projector;
+  };
+  const agentIds = new Set([params.sessionAgentId, params.defaultAgentId].map(normalizeAgentId));
+  if (params.includeAgentsList) {
+    for (const agent of listGatewayAgentsBasic(params.cfg).agents) {
+      agentIds.add(agent.id);
     }
   }
+  await Promise.all(
+    [...agentIds].map(async (agentId) => {
+      modelCatalogByAgentId.set(agentId, await getProjector(agentId).projectCatalog());
+    }),
+  );
+  const sessionProfileId = params.sessionEntry?.authProfileOverride?.trim();
+  const sessionProfileSource = params.sessionEntry?.authProfileOverrideSource;
+  // Legacy rows omitted the source; a compaction count is the durable marker
+  // that the profile was adopted automatically and may fall through.
+  const legacyUserProfile =
+    sessionProfileSource === undefined &&
+    params.sessionEntry?.authProfileOverrideCompactionCount === undefined;
+  const sessionProfiles = sessionProfileId
+    ? {
+        preferredProfileId: sessionProfileId,
+        ...(sessionProfileSource === "user" || legacyUserProfile
+          ? { lockedProfileId: sessionProfileId }
+          : {}),
+      }
+    : undefined;
+  const sessionCatalogProjector = getProjector(params.sessionAgentId, sessionProfiles);
+  const sessionModelCatalog = await sessionCatalogProjector.projectCatalog();
+  return { getProjector, modelCatalogByAgentId, sessionCatalogProjector, sessionModelCatalog };
 }
 
-function createChatAbortOps(context: GatewayRequestContext): ChatAbortOps {
-  return {
+function resolveWebchatPromptCacheKey(params: {
+  agentId: string;
+  model: string;
+  provider: string;
+  sessionKey: string;
+}): string {
+  const digest = createHash("sha256")
+    .update(
+      [
+        "v1",
+        params.provider.trim().toLowerCase(),
+        params.model.trim(),
+        normalizeAgentId(params.agentId),
+        params.sessionKey,
+      ].join("\0"),
+      "utf8",
+    )
+    .digest("hex")
+    .slice(0, 32);
+  return `openclaw-webchat-${digest}`;
+}
+
+export {
+  augmentChatHistoryWithCanvasBlocks,
+  DEFAULT_CHAT_HISTORY_TEXT_MAX_CHARS,
+  dropPreSessionStartAnnouncePairs,
+  resolveEffectiveChatHistoryMaxChars,
+  sanitizeChatHistoryMessages,
+} from "../chat-display-projection.js";
+export { sanitizeChatSendMessageInput } from "../chat-input-sanitize.js";
+export {
+  CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES,
+  enforceChatHistoryFinalBudget,
+  replaceOversizedChatHistoryMessages,
+  reportOmittedChatHistory,
+} from "./chat-history-budget.js";
+
+const CHAT_STARTUP_OPTIONAL_MODEL_CATALOG_TIMEOUT_MS = 25;
+function resolveChatHistoryNextOffset(params: {
+  messages: unknown[];
+  totalMessages: number;
+  offset: number;
+  rawPageMessages: number;
+  replayOldestRecord?: boolean;
+}): number {
+  const oldestSeq = params.messages
+    .map((message) => readChatHistoryMessageSeq(message))
+    .find((seq): seq is number => typeof seq === "number");
+  if (oldestSeq !== undefined) {
+    const recordOffset = params.totalMessages - oldestSeq + 1;
+    const replayOffset = recordOffset - 1;
+    if (params.replayOldestRecord && replayOffset > params.offset) {
+      return replayOffset;
+    }
+    // A replay cursor that does not advance strands every older record. Skip
+    // the pathological projected siblings and continue with the next record.
+    return Math.max(params.offset + 1, recordOffset);
+  }
+  return params.offset + params.rawPageMessages;
+}
+
+function shouldReplayOldestChatHistoryRecord(params: {
+  projected: unknown[];
+  bounded: unknown[];
+}): boolean {
+  const oldestSeq = params.bounded
+    .map((message) => readChatHistoryMessageSeq(message))
+    .find((seq): seq is number => typeof seq === "number");
+  if (oldestSeq === undefined) {
+    return false;
+  }
+  const projectedCount = params.projected.filter(
+    (message) => readChatHistoryMessageSeq(message) === oldestSeq,
+  ).length;
+  const boundedCount = params.bounded.filter(
+    (message) => readChatHistoryMessageSeq(message) === oldestSeq,
+  ).length;
+  return boundedCount < projectedCount;
+}
+
+async function isChatMessageIdVisibleAfterHistoryFilters(params: {
+  sessionId: string;
+  storePath: string | undefined;
+  sessionEntry?: { sessionFile?: string; sessionId?: string };
+  sessionKey: string;
+  agentId?: string;
+  messageId: string;
+  sessionStartedAt?: number;
+  allowResetArchiveFallback?: boolean;
+}): Promise<boolean> {
+  if (params.sessionStartedAt === undefined) {
+    return true;
+  }
+  const messages = await readSessionMessagesAsync(
+    {
+      agentId: params.agentId,
+      sessionEntry: params.sessionEntry,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      storePath: params.storePath,
+    },
+    {
+      mode: "full",
+      reason: "chat.message.get visibility",
+      ...(params.allowResetArchiveFallback === true ? { allowResetArchiveFallback: true } : {}),
+    },
+  );
+  return dropPreSessionStartAnnouncePairs(messages, params.sessionStartedAt).some(
+    (message) => readChatHistoryMessageId(message) === params.messageId,
+  );
+}
+
+async function handleChatHistoryRequest({
+  params,
+  respond,
+  context,
+  method,
+  includeAgentsList,
+  includeMetadata,
+}: GatewayRequestHandlerOptions & {
+  method: ChatHistoryMethod;
+  includeAgentsList?: boolean;
+  includeMetadata?: boolean;
+}) {
+  if (!validateChatHistoryParams(params)) {
+    respond(
+      false,
+      undefined,
+      errorShape(
+        ErrorCodes.INVALID_REQUEST,
+        `invalid ${method} params: ${formatValidationErrors(validateChatHistoryParams.errors)}`,
+      ),
+    );
+    return;
+  }
+  const {
+    sessionKey,
+    limit,
+    offset,
+    messageId,
+    sessionId: requestedSessionId,
+    maxChars,
+  } = params as {
+    sessionKey: string;
+    agentId?: string;
+    limit?: number;
+    offset?: number;
+    messageId?: string;
+    sessionId?: string;
+    maxChars?: number;
+  };
+  if (offset !== undefined && messageId !== undefined) {
+    respond(
+      false,
+      undefined,
+      errorShape(ErrorCodes.INVALID_REQUEST, "offset and messageId cannot be used together"),
+    );
+    return;
+  }
+  if (requestedSessionId !== undefined && messageId === undefined) {
+    respond(
+      false,
+      undefined,
+      errorShape(ErrorCodes.INVALID_REQUEST, "sessionId requires messageId"),
+    );
+    return;
+  }
+  const agentIdOverride = normalizeOptionalText((params as { agentId?: string }).agentId);
+  const requestedAgentId = resolveRequestedChatAgentId({
+    cfg: (context as { getRuntimeConfig?: () => OpenClawConfig }).getRuntimeConfig?.(),
+    requestedSessionKey: sessionKey,
+    agentId: agentIdOverride,
+  });
+  const sessionLoadOptions = requestedAgentId ? { agentId: requestedAgentId } : undefined;
+  const { cfg, storePath, store, entry, canonicalKey } = loadSessionEntry(
+    sessionKey,
+    sessionLoadOptions,
+  );
+  const selectedAgent = validateChatSelectedAgent({
+    cfg,
+    requestedSessionKey: sessionKey,
+    agentId: requestedAgentId,
+  });
+  if (!selectedAgent.ok) {
+    respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, selectedAgent.error));
+    return;
+  }
+  const sessionAgentId = resolveSessionAgentId({
+    sessionKey,
+    config: cfg,
+    agentId: selectedAgent.agentId,
+  });
+  if (requestedSessionId) {
+    const transcriptSessionKey = resolveTranscriptSessionKeyBySessionId({
+      agentId: sessionAgentId,
+      sessionId: requestedSessionId,
+      storePath,
+    });
+    if (
+      !transcriptSessionKey ||
+      scopeLegacySessionKeyToAgent({
+        sessionKey: transcriptSessionKey,
+        agentId: sessionAgentId,
+      }) !== scopeLegacySessionKeyToAgent({ sessionKey: canonicalKey, agentId: sessionAgentId })
+    ) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.INVALID_REQUEST, "sessionId does not belong to sessionKey"),
+      );
+      return;
+    }
+  }
+  const startupModelCatalogLoad =
+    method === "chat.startup"
+      ? startOptionalServerMethodModelCatalogSnapshotLoad(context)
+      : undefined;
+  const modelCatalogPromise = measureDiagnosticsTimelineSpan(
+    `gateway.${method}.model_catalog`,
+    () =>
+      startupModelCatalogLoad
+        ? loadOptionalServerMethodModelCatalogSnapshot(context, method, {
+            logOnceKey: "chat.startup",
+            startedLoad: startupModelCatalogLoad,
+            timeoutMs: CHAT_STARTUP_OPTIONAL_MODEL_CATALOG_TIMEOUT_MS,
+          })
+        : loadOptionalServerMethodModelCatalog(context, method).then((entries) =>
+            entries ? { entries, routeVariants: entries } : undefined,
+          ),
+    {
+      config: cfg,
+      phase: method,
+    },
+  );
+  if (startupModelCatalogLoad) {
+    void modelCatalogPromise.catch(() => undefined);
+  }
+  const sessionId = requestedSessionId ?? entry?.sessionId;
+  const historyEntry =
+    requestedSessionId && requestedSessionId !== entry?.sessionId ? undefined : entry;
+  const resolvedSessionModel = resolveSessionModelRef(cfg, entry, sessionAgentId);
+  const requested = typeof limit === "number" ? limit : 200;
+  const max = Math.min(1000, requested);
+  const maxHistoryBytes = getMaxChatHistoryMessagesBytes();
+  const effectiveMaxChars = resolveEffectiveChatHistoryMaxChars(cfg, maxChars);
+  let historyPage: Awaited<ReturnType<typeof readChatHistoryPage>>;
+  try {
+    historyPage = await readChatHistoryPage({
+      entry: historyEntry,
+      provider: resolvedSessionModel.provider,
+      sessionId,
+      storePath,
+      sessionAgentId,
+      canonicalKey,
+      max,
+      maxHistoryBytes,
+      effectiveMaxChars,
+      offset,
+      messageId,
+    });
+  } catch (error) {
+    if (!isSessionTranscriptProjectionUnavailableError(error)) {
+      throw error;
+    }
+    respond(
+      false,
+      undefined,
+      errorShape(ErrorCodes.UNAVAILABLE, "session history is rebuilding; retry shortly", {
+        details: { method },
+        retryable: true,
+        retryAfterMs: 250,
+      }),
+    );
+    return;
+  }
+  const normalized = enrichChatHistoryCompactionMarkers(historyPage.messages, historyEntry);
+  const perMessageHardCap = Math.min(CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES, maxHistoryBytes);
+  const replaced = replaceOversizedChatHistoryMessages({
+    messages: normalized,
+    maxSingleMessageBytes: perMessageHardCap,
+  });
+  scheduleChatHistoryManagedImageCleanup({
+    sessionKey,
+    ...(selectedAgent.agentId ? { agentId: selectedAgent.agentId } : {}),
+    context,
+  });
+  const capped = messageId
+    ? (capChatHistoryAroundMessage({
+        messages: replaced.messages,
+        messageId,
+        fits: (messages) => jsonUtf8Bytes(messages) <= maxHistoryBytes,
+      }) ?? capArrayByJsonBytes(replaced.messages, maxHistoryBytes).items)
+    : capArrayByJsonBytes(replaced.messages, maxHistoryBytes).items;
+  const bounded = enforceChatHistoryFinalBudget({ messages: capped, maxBytes: maxHistoryBytes });
+  const historyBudgetPreserved =
+    replaced.replacedCount === 0 &&
+    capped.length === normalized.length &&
+    bounded.messages.length === capped.length &&
+    bounded.messages.every((message, index) => message === capped[index]);
+  const pagination = historyPage.pagination;
+  const candidateNextOffset =
+    pagination === undefined
+      ? undefined
+      : resolveChatHistoryNextOffset({
+          messages: bounded.messages,
+          totalMessages: pagination.totalMessages,
+          offset: pagination.offset,
+          rawPageMessages: pagination.rawPageMessages,
+          replayOldestRecord: shouldReplayOldestChatHistoryRecord({
+            projected: normalized,
+            bounded: bounded.messages,
+          }),
+        });
+  const hasMore =
+    pagination !== undefined && candidateNextOffset !== undefined
+      ? pagination.exhausted !== true && candidateNextOffset < pagination.totalMessages
+      : undefined;
+  const nextOffset = hasMore ? candidateNextOffset : undefined;
+  reportOmittedChatHistory({
+    originalMessages: normalized,
+    finalMessages: bounded.messages,
+    normalizedBytes: jsonUtf8Bytes(normalized),
+    maxHistoryBytes,
+    logDebug: (message) => context.logGateway.debug(message),
+  });
+  const modelCatalogSnapshot = await modelCatalogPromise;
+  const modelCatalog = modelCatalogSnapshot?.entries;
+  const defaultAgentId = resolveDefaultAgentId(cfg);
+  const startupCatalogProjection =
+    method === "chat.startup" && modelCatalogSnapshot
+      ? await buildChatStartupModelCatalogProjection({
+          cfg,
+          snapshot: modelCatalogSnapshot,
+          sessionAgentId,
+          sessionEntry: entry,
+          defaultAgentId,
+          includeAgentsList: includeAgentsList === true,
+        })
+      : undefined;
+  const sessionModelCatalog = startupCatalogProjection?.sessionModelCatalog ?? modelCatalog;
+  const defaultModelCatalog =
+    startupCatalogProjection?.modelCatalogByAgentId.get(normalizeAgentId(defaultAgentId)) ??
+    modelCatalog;
+  const startupMetadata = includeMetadata
+    ? await buildChatStartupMetadataResult({
+        cfg,
+        context,
+        agentId: sessionAgentId,
+        modelCatalog: modelCatalogSnapshot,
+        ...(startupCatalogProjection
+          ? { catalogProjector: startupCatalogProjection.sessionCatalogProjector }
+          : {}),
+      })
+    : undefined;
+  const sessionInfo = buildGatewaySessionInfo({
+    cfg,
+    storePath,
+    store,
+    key: canonicalKey,
+    entry,
+    agentId: selectedAgent.agentId,
+    modelCatalog: sessionModelCatalog,
+  });
+  const activeRunAgentId =
+    canonicalKey === "global" ? (selectedAgent.agentId ?? defaultAgentId) : selectedAgent.agentId;
+  const activeRunState = resolveVisibleActiveSessionRunState({
+    context,
+    requestedKey: sessionKey,
+    canonicalKey,
+    sessionId: entry?.sessionId,
+    ...(activeRunAgentId ? { agentId: activeRunAgentId } : {}),
+    defaultAgentId,
+  });
+  sessionInfo.hasActiveRun = activeRunState.active;
+  sessionInfo.activeRunIds = activeRunState.runIds;
+  const defaults = getSessionDefaults(cfg, defaultModelCatalog, {
+    allowPluginNormalization: false,
+  });
+  const thinkingLevel = sessionInfo.thinkingLevel ?? sessionInfo.thinkingDefault;
+  const verboseLevel = entry?.verboseLevel ?? cfg.agents?.defaults?.verboseDefault;
+  sessionInfo.verboseLevel = verboseLevel;
+  // Surface any run still streaming for this session+agent so a client that
+  // switched away (and stopped receiving the run's per-agent-delivered events)
+  // can restore the in-flight assistant text on switch-back.
+  const inFlightRun = resolveInFlightRunSnapshot({
     chatAbortControllers: context.chatAbortControllers,
     chatRunBuffers: context.chatRunBuffers,
-    chatDeltaSentAt: context.chatDeltaSentAt,
-    chatAbortedRuns: context.chatAbortedRuns,
-    removeChatRun: context.removeChatRun,
-    agentRunSeq: context.agentRunSeq,
-    broadcast: context.broadcast,
-    nodeSendToSession: context.nodeSendToSession,
-  };
-}
-
-function abortChatRunsForSessionKeyWithPartials(params: {
-  context: GatewayRequestContext;
-  ops: ChatAbortOps;
-  sessionKey: string;
-  abortOrigin: AbortOrigin;
-  stopReason?: string;
-}) {
-  const snapshots = collectSessionAbortPartials({
-    chatAbortControllers: params.context.chatAbortControllers,
-    chatRunBuffers: params.context.chatRunBuffers,
-    sessionKey: params.sessionKey,
-    abortOrigin: params.abortOrigin,
+    requestedSessionKey: sessionKey,
+    canonicalSessionKey: resolveSessionStoreKey({ cfg, sessionKey }),
+    agentId: activeRunAgentId,
+    defaultAgentId,
   });
-  const res = abortChatRunsForSessionKey(params.ops, {
-    sessionKey: params.sessionKey,
-    stopReason: params.stopReason,
+  const boundedInFlightRun = boundInFlightRunSnapshotForChatHistory({
+    snapshot: inFlightRun,
+    messages: bounded.messages,
+    maxBytes: maxHistoryBytes,
   });
-  if (res.aborted) {
-    persistAbortedPartials({
-      context: params.context,
-      sessionKey: params.sessionKey,
-      snapshots,
-    });
-  }
-  return res;
-}
-
-function nextChatSeq(context: { agentRunSeq: Map<string, number> }, runId: string) {
-  const next = (context.agentRunSeq.get(runId) ?? 0) + 1;
-  context.agentRunSeq.set(runId, next);
-  return next;
-}
-
-function broadcastChatFinal(params: {
-  context: Pick<GatewayRequestContext, "broadcast" | "nodeSendToSession" | "agentRunSeq">;
-  runId: string;
-  sessionKey: string;
-  message?: Record<string, unknown>;
-}) {
-  const seq = nextChatSeq({ agentRunSeq: params.context.agentRunSeq }, params.runId);
-  const strippedEnvelopeMessage = stripEnvelopeFromMessage(params.message) as
-    | Record<string, unknown>
-    | undefined;
   const payload = {
-    runId: params.runId,
-    sessionKey: params.sessionKey,
-    seq,
-    state: "final" as const,
-    message: stripInlineDirectiveTagsFromMessageForDisplay(strippedEnvelopeMessage),
+    sessionKey,
+    sessionId,
+    messages: bounded.messages,
+    ...(historyPage.responseOffset !== undefined ? { offset: historyPage.responseOffset } : {}),
+    ...(hasMore ? { nextOffset } : {}),
+    ...(hasMore !== undefined ? { hasMore } : {}),
+    ...(pagination !== undefined ? { totalMessages: pagination.totalMessages } : {}),
+    ...(historyPage.completeCliImport && !hasMore && historyBudgetPreserved
+      ? { completeSnapshot: true }
+      : {}),
+    defaults,
+    sessionInfo,
+    thinkingLevel,
+    fastMode: entry?.fastMode,
+    verboseLevel,
+    ...(boundedInFlightRun ? { inFlightRun: boundedInFlightRun } : {}),
+    ...(includeAgentsList
+      ? {
+          agentsList: listAgentsForGateway(
+            cfg,
+            modelCatalog,
+            startupCatalogProjection
+              ? { modelCatalogByAgentId: startupCatalogProjection.modelCatalogByAgentId }
+              : undefined,
+          ),
+        }
+      : {}),
+    ...(startupMetadata ? { metadata: startupMetadata } : {}),
   };
-  params.context.broadcast("chat", payload);
-  params.context.nodeSendToSession(params.sessionKey, "chat", payload);
-  params.context.agentRunSeq.delete(params.runId);
-}
-
-function broadcastChatError(params: {
-  context: Pick<GatewayRequestContext, "broadcast" | "nodeSendToSession" | "agentRunSeq">;
-  runId: string;
-  sessionKey: string;
-  errorMessage?: string;
-}) {
-  const seq = nextChatSeq({ agentRunSeq: params.context.agentRunSeq }, params.runId);
-  const payload = {
-    runId: params.runId,
-    sessionKey: params.sessionKey,
-    seq,
-    state: "error" as const,
-    errorMessage: params.errorMessage,
-  };
-  params.context.broadcast("chat", payload);
-  params.context.nodeSendToSession(params.sessionKey, "chat", payload);
-  params.context.agentRunSeq.delete(params.runId);
+  respond(true, payload);
 }
 
 export const chatHandlers: GatewayRequestHandlers = {
-  "chat.history": async ({ params, respond, context }) => {
-    if (!validateChatHistoryParams(params)) {
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.INVALID_REQUEST,
-          `invalid chat.history params: ${formatValidationErrors(validateChatHistoryParams.errors)}`,
-        ),
-      );
-      return;
-    }
-    const { sessionKey, limit } = params as {
-      sessionKey: string;
-      limit?: number;
-    };
-    const { cfg, storePath, entry } = loadSessionEntry(sessionKey);
-    const sessionId = entry?.sessionId;
-    const rawMessages =
-      sessionId && storePath ? readSessionMessages(sessionId, storePath, entry?.sessionFile) : [];
-    const hardMax = 1000;
-    const defaultLimit = 200;
-    const requested = typeof limit === "number" ? limit : defaultLimit;
-    const max = Math.min(hardMax, requested);
-    const sliced = rawMessages.length > max ? rawMessages.slice(-max) : rawMessages;
-    const sanitized = stripEnvelopeFromMessages(sliced);
-    const normalized = sanitizeChatHistoryMessages(sanitized);
-    const maxHistoryBytes = getMaxChatHistoryMessagesBytes();
-    const perMessageHardCap = Math.min(CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES, maxHistoryBytes);
-    const replaced = replaceOversizedChatHistoryMessages({
-      messages: normalized,
-      maxSingleMessageBytes: perMessageHardCap,
-    });
-    const capped = capArrayByJsonBytes(replaced.messages, maxHistoryBytes).items;
-    const bounded = enforceChatHistoryFinalBudget({ messages: capped, maxBytes: maxHistoryBytes });
-    const placeholderCount = replaced.replacedCount + bounded.placeholderCount;
-    if (placeholderCount > 0) {
-      chatHistoryPlaceholderEmitCount += placeholderCount;
-      context.logGateway.debug(
-        `chat.history omitted oversized payloads placeholders=${placeholderCount} total=${chatHistoryPlaceholderEmitCount}`,
-      );
-    }
-    let thinkingLevel = entry?.thinkingLevel;
-    if (!thinkingLevel) {
-      const configured = cfg.agents?.defaults?.thinkingDefault;
-      if (configured) {
-        thinkingLevel = configured;
-      } else {
-        const sessionAgentId = resolveSessionAgentId({ sessionKey, config: cfg });
-        const { provider, model } = resolveSessionModelRef(cfg, entry, sessionAgentId);
-        const catalog = await context.loadGatewayModelCatalog();
-        thinkingLevel = resolveThinkingDefault({
-          cfg,
-          provider,
-          model,
-          catalog,
-        });
-      }
-    }
-    const verboseLevel = entry?.verboseLevel ?? cfg.agents?.defaults?.verboseDefault;
-    respond(true, {
-      sessionKey,
-      sessionId,
-      messages: bounded.messages,
-      thinkingLevel,
-      verboseLevel,
+  "chat.history": async (opts) => {
+    await handleChatHistoryRequest({ ...opts, method: "chat.history" });
+  },
+  "chat.startup": async (opts) => {
+    await handleChatHistoryRequest({
+      ...opts,
+      method: "chat.startup",
+      includeAgentsList: true,
+      includeMetadata: true,
     });
   },
-  "chat.abort": ({ params, respond, context }) => {
-    if (!validateChatAbortParams(params)) {
+  "chat.metadata": handleChatMetadataRequest,
+  "chat.toolTitles": async ({ params, respond, context }) => {
+    if (!validateChatToolTitlesParams(params)) {
       respond(
         false,
         undefined,
         errorShape(
           ErrorCodes.INVALID_REQUEST,
-          `invalid chat.abort params: ${formatValidationErrors(validateChatAbortParams.errors)}`,
+          `invalid chat.toolTitles params: ${formatValidationErrors(validateChatToolTitlesParams.errors)}`,
         ),
       );
       return;
     }
-    const { sessionKey: rawSessionKey, runId } = params as {
-      sessionKey: string;
-      runId?: string;
-    };
-
-    const ops = createChatAbortOps(context);
-
-    if (!runId) {
-      const res = abortChatRunsForSessionKeyWithPartials({
-        context,
-        ops,
-        sessionKey: rawSessionKey,
-        abortOrigin: "rpc",
-        stopReason: "rpc",
+    const cfg = context.getRuntimeConfig();
+    // Opt-in gate: tool titles spend utility-model tokens, so the gateway
+    // stays fully deterministic unless the operator enables them explicitly.
+    // `disabled: true` lets clients stop asking for the rest of the session.
+    if (cfg.gateway?.controlUi?.toolTitles !== true) {
+      respond(true, { titles: {}, disabled: true });
+      return;
+    }
+    const agentIdOverride = normalizeOptionalText(params.agentId);
+    const requestedAgentId = resolveRequestedChatAgentId({
+      cfg,
+      requestedSessionKey: params.sessionKey,
+      agentId: agentIdOverride,
+    });
+    const selectedAgent = validateChatSelectedAgent({
+      cfg,
+      requestedSessionKey: params.sessionKey,
+      agentId: requestedAgentId,
+    });
+    if (!selectedAgent.ok) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, selectedAgent.error));
+      return;
+    }
+    try {
+      const sessionAgentId = resolveSessionAgentId({
+        sessionKey: params.sessionKey,
+        config: cfg,
+        agentId: selectedAgent.agentId,
       });
-      respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
-      return;
+      // Session entry carries per-session model overrides; utility routing must
+      // derive its small-model default from the provider this session actually
+      // uses, not the agent's configured default.
+      const { cfg: sessionCfg, entry } = loadSessionEntry(
+        params.sessionKey,
+        selectedAgent.agentId ? { agentId: selectedAgent.agentId } : undefined,
+      );
+      const sessionModel = resolveSessionModelRef(sessionCfg, entry, sessionAgentId);
+      // Title generation pulls in the simple-completion runtime; load it lazily
+      // so gateways that never enable the opt-in skip that cost.
+      const { generateToolCallTitles } = await import("../chat-tool-titles.js");
+      const titles = await generateToolCallTitles({
+        cfg: sessionCfg,
+        agentId: sessionAgentId,
+        sessionPrimaryProvider: sessionModel.provider,
+        sessionAuthProfile: entry?.authProfileOverride?.trim() || undefined,
+        items: params.items,
+      });
+      respond(true, { titles });
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, String(err)));
     }
-
-    const active = context.chatAbortControllers.get(runId);
-    if (!active) {
-      respond(true, { ok: true, aborted: false, runIds: [] });
-      return;
-    }
-    if (active.sessionKey !== rawSessionKey) {
+  },
+  "chat.message.get": async ({ params, respond, context }) => {
+    if (!validateChatMessageGetParams(params)) {
       respond(
         false,
         undefined,
-        errorShape(ErrorCodes.INVALID_REQUEST, "runId does not match sessionKey"),
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid chat.message.get params: ${formatValidationErrors(validateChatMessageGetParams.errors)}`,
+        ),
       );
       return;
     }
-
-    const partialText = context.chatRunBuffers.get(runId);
-    const res = abortChatRunById(ops, {
-      runId,
-      sessionKey: rawSessionKey,
-      stopReason: "rpc",
+    const { sessionKey, messageId, maxChars } = params as {
+      sessionKey: string;
+      agentId?: string;
+      messageId: string;
+      maxChars?: number;
+    };
+    const agentIdOverride = normalizeOptionalText((params as { agentId?: string }).agentId);
+    const requestedAgentId = resolveRequestedChatAgentId({
+      cfg: (context as { getRuntimeConfig?: () => OpenClawConfig }).getRuntimeConfig?.(),
+      requestedSessionKey: sessionKey,
+      agentId: agentIdOverride,
     });
-    if (res.aborted && partialText && partialText.trim()) {
-      persistAbortedPartials({
-        context,
-        sessionKey: rawSessionKey,
-        snapshots: [
-          {
-            runId,
-            sessionId: active.sessionId,
-            text: partialText,
-            abortOrigin: "rpc",
-          },
-        ],
-      });
+    const sessionLoadOptions = requestedAgentId ? { agentId: requestedAgentId } : undefined;
+    const { cfg, storePath, entry } = loadSessionEntry(sessionKey, sessionLoadOptions);
+    const selectedAgent = validateChatSelectedAgent({
+      cfg,
+      requestedSessionKey: sessionKey,
+      agentId: requestedAgentId,
+    });
+    if (!selectedAgent.ok) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, selectedAgent.error));
+      return;
     }
+    const sessionId = entry?.sessionId;
+    if (!sessionId) {
+      respond(true, { ok: false, unavailableReason: "not_found" });
+      return;
+    }
+
+    const sessionAgentId = resolveSessionAgentId({
+      sessionKey,
+      config: cfg,
+      agentId: selectedAgent.agentId,
+    });
+    const resolved = await readSessionMessageByIdAsync(
+      {
+        agentId: sessionAgentId,
+        sessionEntry: entry,
+        sessionId,
+        sessionKey,
+        storePath,
+      },
+      messageId,
+      { allowResetArchiveFallback: true },
+    );
+    if (!resolved.found) {
+      respond(true, { ok: false, unavailableReason: "not_found" });
+      return;
+    }
+    const visible = await isChatMessageIdVisibleAfterHistoryFilters({
+      sessionId,
+      storePath,
+      sessionEntry: entry,
+      sessionKey,
+      agentId: sessionAgentId,
+      messageId,
+      sessionStartedAt:
+        typeof entry?.sessionStartedAt === "number" ? entry.sessionStartedAt : undefined,
+      allowResetArchiveFallback: true,
+    });
+    if (!visible) {
+      respond(true, { ok: false, unavailableReason: "not_found" });
+      return;
+    }
+    if (resolved.oversized) {
+      respond(true, { ok: false, unavailableReason: "oversized" });
+      return;
+    }
+
+    const effectiveMaxChars =
+      typeof maxChars === "number" ? maxChars : Math.min(MAX_PAYLOAD_BYTES, 1_000_000);
+    const projectedMessage = resolved.message
+      ? projectChatDisplayMessage(resolved.message, {
+          maxChars: effectiveMaxChars,
+        })
+      : undefined;
+    const projected = projectedMessage
+      ? augmentChatHistoryWithCanvasBlocks([projectedMessage])[0]
+      : undefined;
+    if (!projected) {
+      respond(true, { ok: false, unavailableReason: "not_visible" });
+      return;
+    }
+
     respond(true, {
       ok: true,
-      aborted: res.aborted,
-      runIds: res.aborted ? [runId] : [],
+      message: projected,
     });
   },
+  "chat.abort": handleChatAbortRequest,
   "chat.send": async ({ params, respond, context, client }) => {
-    if (!validateChatSendParams(params)) {
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.INVALID_REQUEST,
-          `invalid chat.send params: ${formatValidationErrors(validateChatSendParams.errors)}`,
-        ),
-      );
+    const normalizedRequest = normalizeChatSendRequest({ params, client });
+    if (!normalizedRequest.ok) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, normalizedRequest.error));
       return;
     }
-    const p = params as {
-      sessionKey: string;
-      message: string;
-      thinking?: string;
-      deliver?: boolean;
-      attachments?: Array<{
-        type?: string;
-        mimeType?: string;
-        fileName?: string;
-        content?: unknown;
-      }>;
-      timeoutMs?: number;
-      idempotencyKey: string;
-    };
-    const sanitizedMessageResult = sanitizeChatSendMessageInput(p.message);
-    if (!sanitizedMessageResult.ok) {
-      respond(
-        false,
-        undefined,
-        errorShape(ErrorCodes.INVALID_REQUEST, sanitizedMessageResult.error),
-      );
-      return;
-    }
-    const inboundMessage = sanitizedMessageResult.message;
-    const stopCommand = isChatStopCommandText(inboundMessage);
-    const normalizedAttachments = normalizeRpcAttachmentsToChatAttachments(p.attachments);
-    const rawMessage = inboundMessage.trim();
-    if (!rawMessage && normalizedAttachments.length === 0) {
-      respond(
-        false,
-        undefined,
-        errorShape(ErrorCodes.INVALID_REQUEST, "message or attachment required"),
-      );
-      return;
-    }
-    let parsedMessage = inboundMessage;
-    let parsedImages: ChatImageContent[] = [];
-    if (normalizedAttachments.length > 0) {
-      try {
-        const parsed = await parseMessageWithAttachments(inboundMessage, normalizedAttachments, {
-          maxBytes: 5_000_000,
-          log: context.logGateway,
-        });
-        parsedMessage = parsed.message;
-        parsedImages = parsed.images;
-      } catch (err) {
-        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, String(err)));
-        return;
-      }
-    }
-    const rawSessionKey = p.sessionKey;
-    const { cfg, entry, canonicalKey: sessionKey } = loadSessionEntry(rawSessionKey);
-    const timeoutMs = resolveAgentTimeoutMs({
-      cfg,
-      overrideMs: p.timeoutMs,
+    const {
+      chatSendReceivedAtMs,
+      clientInfo,
+      supportsTaskSuggestions,
+      p,
+      systemInputProvenance,
+      rawMessage,
+      reconnectResumeRequested,
+    } = normalizedRequest.value;
+    const preparedSession = prepareChatSendSession({
+      request: normalizedRequest.value,
+      context,
+      client,
     });
-    const now = Date.now();
-    const clientRunId = p.idempotencyKey;
-
-    const sendPolicy = resolveSendPolicy({
+    if (!preparedSession.ok) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, preparedSession.error));
+      return;
+    }
+    const {
+      clientRunId,
+      sessionLoadOptions,
+      sessionLoadMs,
       cfg,
+      storePath,
       entry,
       sessionKey,
-      channel: entry?.channel,
-      chatType: entry?.chatType,
+      sessionRoutingChanged,
+      selectedAgent,
+      requestedSessionId,
+      backingSessionId,
+      agentId,
+      activeRunScopeKey,
+      resolvedSessionModel,
+      now,
+    } = preparedSession.value;
+    const shouldAdmit = await runChatSendPreAdmission({
+      request: normalizedRequest.value,
+      session: preparedSession.value,
+      respond,
+      context,
+      client,
     });
-    if (sendPolicy === "deny") {
-      respond(
-        false,
-        undefined,
-        errorShape(ErrorCodes.INVALID_REQUEST, "send blocked by session policy"),
-      );
+    if (!shouldAdmit) {
+      return;
+    }
+    const admitted = await admitChatSend({
+      request: normalizedRequest.value,
+      session: preparedSession.value,
+      respond,
+      context,
+      client,
+    });
+    if (!admitted.ok) {
+      return;
+    }
+    const {
+      activeRunAbort,
+      admittedSessionId,
+      chatSendTraceAttributes,
+      cleanupAdmittedRun,
+      finishAbortedChatSend,
+      gatewayWorkAdmission,
+      lifecycleGeneration,
+      restartSafeAdmission,
+      setReleaseGatewayRootContinuation,
+    } = admitted.value;
+    const preparedAttachments = await prepareChatSendAttachments({
+      request: normalizedRequest.value,
+      session: preparedSession.value,
+      admission: admitted.value,
+      respond,
+      context,
+    });
+    if (!preparedAttachments.ok) {
+      return;
+    }
+    if (activeRunAbort.controller.signal.aborted) {
+      finishAbortedChatSend();
       return;
     }
 
-    if (stopCommand) {
-      const res = abortChatRunsForSessionKeyWithPartials({
-        context,
-        ops: createChatAbortOps(context),
-        sessionKey: rawSessionKey,
-        abortOrigin: "stop-command",
-        stopReason: "stop",
-      });
-      respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
+    // Attachment preparation can suspend. Recheck immediately before the
+    // synchronous ACK path so aborts and hot routing reloads cannot cross it.
+    if (sessionRoutingChanged(context.getRuntimeConfig())) {
+      cleanupAdmittedRun({ force: true });
+      clearAgentRunContext(clientRunId, lifecycleGeneration);
+      respondChatSessionRoutingChanged(respond);
       return;
     }
+    const { imageOrder, prepareAttachmentsMs } = preparedAttachments.value;
 
-    const cached = context.dedupe.get(`chat:${clientRunId}`);
-    if (cached) {
-      respond(cached.ok, cached.payload, cached.error, {
-        cached: true,
+    const admissionStartedAt = Date.now();
+    const terminalizeRestartSafeAdmission = async (terminalState: {
+      retryable: boolean;
+      status: "failed" | "killed";
+    }): Promise<boolean> =>
+      await terminalizeRestartSafeChatAdmission({
+        admittedSessionId,
+        clientRunId,
+        sessionKey,
+        startedAt: admissionStartedAt,
+        storePath,
+        ...terminalState,
       });
-      return;
-    }
-
-    const activeExisting = context.chatAbortControllers.get(clientRunId);
-    if (activeExisting) {
-      respond(true, { runId: clientRunId, status: "in_flight" as const }, undefined, {
-        cached: true,
-        runId: clientRunId,
-      });
-      return;
-    }
 
     try {
-      const abortController = new AbortController();
-      context.chatAbortControllers.set(clientRunId, {
-        controller: abortController,
-        sessionId: entry?.sessionId ?? clientRunId,
-        sessionKey: rawSessionKey,
-        startedAtMs: now,
-        expiresAtMs: resolveChatRunExpiresAtMs({ now, timeoutMs }),
+      const userTurn = createGatewayChatUserTurnController({
+        agentId,
+        cfg,
+        clientRunId,
+        initialSessionId: admittedSessionId,
+        now,
+        ...(systemInputProvenance ? { provenance: systemInputProvenance } : {}),
+        rawMessage,
+        ...(restartSafeAdmission ? { restartAdmission: restartSafeAdmission } : {}),
+        senderIsOwner: hasGatewayAdminScope(client),
+        sessionKey,
+        ...(sessionLoadOptions ? { sessionLoadOptions } : {}),
+        startedAt: admissionStartedAt,
+        traceAttributes: chatSendTraceAttributes,
+        warn: (message) => context.logGateway.warn(message),
+      });
+      const {
+        persist: persistGatewayUserTurnTranscript,
+        persistBestEffort: persistGatewayUserTurnTranscriptBestEffort,
+        recorder: userTurnRecorder,
+      } = userTurn;
+      if (restartSafeAdmission) {
+        const persistedUserTurn = await persistGatewayUserTurnTranscript();
+        const admittedEntry = persistedUserTurn?.sessionEntry;
+        // A matching idempotency row and lifecycle claim commit atomically, so
+        // retries adopt the durable turn without submitting it twice.
+        if (
+          !persistedUserTurn ||
+          admittedEntry?.status !== "running" ||
+          admittedEntry.restartRecoveryDeliveryRunId !== clientRunId
+        ) {
+          throw new Error("chat turn was not durably admitted");
+        }
+        if (lifecycleGeneration !== getAgentEventLifecycleGeneration()) {
+          if (activeRunAbort.entry) {
+            activeRunAbort.entry.abortStopReason = "restart";
+          }
+          activeRunAbort.controller.abort(createAgentRunRestartAbortError());
+        }
+        if (activeRunAbort.controller.signal.aborted) {
+          if (
+            !(await terminalizeRestartSafeAdmission({
+              retryable: activeRunAbort.entry?.abortStopReason === "restart",
+              status: "killed",
+            }))
+          ) {
+            throw new Error("chat admission ownership changed before terminalization");
+          }
+          finishAbortedChatSend();
+          return;
+        }
+        if (sessionRoutingChanged(context.getRuntimeConfig())) {
+          if (!(await terminalizeRestartSafeAdmission({ retryable: true, status: "failed" }))) {
+            throw new Error("chat admission ownership changed before terminalization");
+          }
+          cleanupAdmittedRun({ force: true });
+          clearAgentRunContext(clientRunId, lifecycleGeneration);
+          respondChatSessionRoutingChanged(respond);
+          return;
+        }
+      }
+
+      const serverTiming = shouldIncludeChatSendAckServerTiming(clientInfo)
+        ? {
+            receivedToAckMs: roundedChatSendTimingMs(performance.now() - chatSendReceivedAtMs),
+            loadSessionMs: sessionLoadMs,
+            ...(prepareAttachmentsMs !== undefined ? { prepareAttachmentsMs } : {}),
+          }
+        : undefined;
+      const chatSendTiming: ChatRunTiming | undefined =
+        serverTiming && typeof client?.connId === "string" && client.connId.trim()
+          ? {
+              ackedAtMs: performance.now(),
+              connId: client.connId.trim(),
+              receivedAtMs: chatSendReceivedAtMs,
+            }
+          : undefined;
+      context.addChatRun(clientRunId, {
+        sessionKey,
+        agentId: selectedAgent.agentId,
+        clientRunId,
+        ...(chatSendTiming ? { chatSendTiming } : {}),
       });
       const ackPayload = {
         runId: clientRunId,
         status: "started" as const,
+        ...(serverTiming ? { serverTiming } : {}),
       };
-      respond(true, ackPayload, undefined, { runId: clientRunId });
-
-      const trimmedMessage = parsedMessage.trim();
-      const injectThinking = Boolean(
-        p.thinking && trimmedMessage && !trimmedMessage.startsWith("/"),
+      emitDiagnosticsTimelineEvent(
+        {
+          type: "mark",
+          name: "gateway.chat_send.ack_ready",
+          phase: "agent-turn",
+          attributes: {
+            ...chatSendTraceAttributes,
+            ackStatus: ackPayload.status,
+            ...chatSendAckServerTimingAttributes(serverTiming),
+          },
+        },
+        { config: cfg },
       );
-      const commandBody = injectThinking ? `/think ${p.thinking} ${parsedMessage}` : parsedMessage;
-      const clientInfo = client?.connect?.client;
-      // Inject timestamp so agents know the current date/time.
-      // Only BodyForAgent gets the timestamp — Body stays raw for UI display.
-      // See: https://github.com/moltbot/moltbot/issues/3658
-      const stampedMessage = injectTimestamp(parsedMessage, timestampOptsFromConfig(cfg));
-
-      const ctx: MsgContext = {
-        Body: parsedMessage,
-        BodyForAgent: stampedMessage,
-        BodyForCommands: commandBody,
-        RawBody: parsedMessage,
-        CommandBody: commandBody,
-        SessionKey: sessionKey,
-        Provider: INTERNAL_MESSAGE_CHANNEL,
-        Surface: INTERNAL_MESSAGE_CHANNEL,
-        OriginatingChannel: INTERNAL_MESSAGE_CHANNEL,
-        ChatType: "direct",
-        CommandAuthorized: true,
-        MessageSid: clientRunId,
-        SenderId: clientInfo?.id,
-        SenderName: clientInfo?.displayName,
-        SenderUsername: clientInfo?.displayName,
-        GatewayClientScopes: client?.connect?.scopes,
-      };
-
-      const agentId = resolveSessionAgentId({
-        sessionKey,
-        config: cfg,
-      });
-      const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
-        cfg,
-        agentId,
-        channel: INTERNAL_MESSAGE_CHANNEL,
-      });
-      const finalReplyParts: string[] = [];
-      const dispatcher = createReplyDispatcher({
-        ...prefixOptions,
-        onError: (err) => {
-          context.logGateway.warn(`webchat dispatch failed: ${formatForLog(err)}`);
-        },
-        deliver: async (payload, info) => {
-          if (info.kind !== "final") {
+      respond(true, ackPayload, undefined, { runId: clientRunId });
+      const chatSendAckedAtMs = chatSendTiming?.ackedAtMs ?? performance.now();
+      const titleSource = stripInlineDirectiveTagsForDisplay(rawMessage).text;
+      if (isDashboardSessionTitleCandidate({ sessionKey, userMessage: titleSource })) {
+        void runWithGatewayIndependentRootWorkContinuation(async () => {
+          const titleEntry =
+            entry?.sessionId === admittedSessionId
+              ? entry
+              : loadSessionEntry(sessionKey, sessionLoadOptions).entry;
+          const titleSessionId = titleEntry?.sessionId;
+          if (!titleSessionId) {
             return;
           }
-          const text = payload.text?.trim() ?? "";
-          if (!text) {
-            return;
+          const updated = await maybeGenerateDashboardSessionTitle({
+            cfg,
+            agentId,
+            entry: titleEntry,
+            sessionId: titleSessionId,
+            sessionKey,
+            storePath,
+            userMessage: titleSource,
+          });
+          if (updated) {
+            emitSessionsChanged(context, {
+              sessionKey,
+              agentId,
+              reason: "chat.title",
+            });
           }
-          finalReplyParts.push(text);
-        },
+        }).catch((err: unknown) => {
+          context.logGateway.warn(
+            `dashboard session title generation failed: ${formatForLog(err)}`,
+          );
+        });
+      }
+      const {
+        accountId,
+        ctx,
+        isInternalTextSlashCommandTurn,
+        pluginBoundMediaFieldsPromise,
+        queuedFollowupOwnerKey,
+        replyOptionImages,
+      } = prepareChatSendUserTurn({
+        request: normalizedRequest.value,
+        session: preparedSession.value,
+        admission: admitted.value,
+        attachments: preparedAttachments.value,
+        client,
+        logGateway: context.logGateway,
+        userTurn,
       });
 
       let agentRunStarted = false;
-      void dispatchInboundMessage({
-        ctx,
-        cfg,
-        dispatcher,
-        replyOptions: {
+      const { deliveredReplies, dispatcher, hasAppendedWebchatAgentMedia, onModelSelected } =
+        createChatSendReplyDispatch({
+          accountId,
+          isAgentRunStarted: () => agentRunStarted,
+          logGateway: context.logGateway,
+          session: preparedSession.value,
+          userTurnRecorder,
+        });
+      let queuedFollowupEnqueued = false;
+      const dispatchErrorLifecycle = createChatSendDispatchErrorLifecycle({
+        admission: admitted.value,
+        context,
+        isQueuedFollowupEnqueued: () => queuedFollowupEnqueued,
+        persistUserTurnTranscript: persistGatewayUserTurnTranscript,
+        session: preparedSession.value,
+        terminalizeRestartSafeAdmission,
+        userTurnRecorder,
+      });
+      const emitServerTiming = (
+        phase: ChatSendServerTimingPhase,
+        extra?: Record<string, string | number>,
+        dispatchStartedAtMs?: number,
+      ) => {
+        emitOperatorChatSendServerTiming({
+          context,
+          client,
+          phase,
           runId: clientRunId,
-          abortSignal: abortController.signal,
-          images: parsedImages.length > 0 ? parsedImages : undefined,
-          onAgentRunStart: (runId) => {
-            agentRunStarted = true;
-            const connId = typeof client?.connId === "string" ? client.connId : undefined;
-            const wantsToolEvents = hasGatewayClientCap(
-              client?.connect?.caps,
-              GATEWAY_CLIENT_CAPS.TOOL_EVENTS,
-            );
-            if (connId && wantsToolEvents) {
-              context.registerToolEventRecipient(runId, connId);
-              // Register for any other active runs *in the same session* so
-              // late-joining clients (e.g. page refresh mid-response) receive
-              // in-progress tool events without leaking cross-session data.
-              for (const [activeRunId, active] of context.chatAbortControllers) {
-                if (activeRunId !== runId && active.sessionKey === p.sessionKey) {
-                  context.registerToolEventRecipient(activeRunId, connId);
-                }
-              }
-            }
-          },
-          onModelSelected,
-        },
-      })
-        .then(() => {
-          if (!agentRunStarted) {
-            const combinedReply = finalReplyParts
-              .map((part) => part.trim())
-              .filter(Boolean)
-              .join("\n\n")
-              .trim();
-            let message: Record<string, unknown> | undefined;
-            if (combinedReply) {
-              const { storePath: latestStorePath, entry: latestEntry } =
-                loadSessionEntry(sessionKey);
-              const sessionId = latestEntry?.sessionId ?? entry?.sessionId ?? clientRunId;
-              const appended = appendAssistantTranscriptMessage({
-                message: combinedReply,
-                sessionId,
-                storePath: latestStorePath,
-                sessionFile: latestEntry?.sessionFile,
-                agentId,
-                createIfMissing: true,
+          sessionKey,
+          agentId,
+          receivedAtMs: chatSendReceivedAtMs,
+          ackedAtMs: chatSendAckedAtMs,
+          dispatchStartedAtMs,
+          extra,
+        });
+      };
+      const dispatchStartedAtMs = performance.now();
+      if (chatSendTiming) {
+        chatSendTiming.dispatchStartedAtMs = dispatchStartedAtMs;
+      }
+      emitServerTiming("dispatch-started");
+      let firstAssistantServerTimingEmitted = false;
+      const emitFirstAssistantServerTiming = () => {
+        if (firstAssistantServerTimingEmitted || chatSendTiming?.firstAssistantEventSent) {
+          return;
+        }
+        firstAssistantServerTimingEmitted = true;
+        if (chatSendTiming) {
+          chatSendTiming.firstAssistantEventSent = true;
+        }
+        emitServerTiming("first-assistant-event", undefined, dispatchStartedAtMs);
+      };
+      // Reserve the detached dispatch before this request releases its root. Otherwise
+      // its inherited ALS context becomes retired and rejects queued/session work.
+      setReleaseGatewayRootContinuation(retainGatewayRootWorkAdmissionContinuation() ?? undefined);
+      void gatewayWorkAdmission
+        .run(() =>
+          measureDiagnosticsTimelineSpan(
+            "gateway.chat_send.dispatch_inbound",
+            async () => {
+              applyChatSendManagedMediaFields(ctx, await pluginBoundMediaFieldsPromise);
+              const dispatchResult = await dispatchInboundMessage({
+                ctx,
+                cfg,
+                dispatcher,
+                onSessionMetadataChanges: (changes) => {
+                  for (const change of changes) {
+                    emitSessionsChanged(context, change);
+                  }
+                },
+                replyOptions: {
+                  runId: clientRunId,
+                  ...(isOperatorUiClient(clientInfo)
+                    ? {
+                        promptCacheKey: resolveWebchatPromptCacheKey({
+                          agentId,
+                          provider: resolvedSessionModel.provider,
+                          model: resolvedSessionModel.model,
+                          sessionKey: activeRunScopeKey,
+                        }),
+                      }
+                    : {}),
+                  ...(supportsTaskSuggestions
+                    ? { taskSuggestionDeliveryMode: "gateway" as const }
+                    : {}),
+                  requestedSessionId,
+                  ...(restartSafeAdmission
+                    ? {
+                        expectedExistingSessionId: admittedSessionId,
+                        pinExpectedExistingSession: true,
+                      }
+                    : entry?.sessionId
+                      ? { expectedExistingSessionId: entry.sessionId }
+                      : {}),
+                  resumeRequestedSession: reconnectResumeRequested,
+                  onSessionPrepared: (binding) => {
+                    if (binding.sessionKey === sessionKey) {
+                      userTurn.setAcceptedSessionId(binding.sessionId);
+                    }
+                  },
+                  abortSignal: activeRunAbort.controller.signal,
+                  // Keep a Gateway-owned cancel identity after this chat.send
+                  // terminalizes while the prompt waits in followup/collect queue.
+                  turnAdoptionLifecycle: {
+                    // Gateway cancel identity only — share collect key via ownerKey.
+                    admission: "cancel-only",
+                    ownerKey: queuedFollowupOwnerKey,
+                    onAdopted: async () => {},
+                    onDeferred: () => {
+                      queuedFollowupEnqueued = registerQueuedChatTurn({
+                        chatQueuedTurns: ensureChatQueuedTurns(context),
+                        runId: clientRunId,
+                        controller: activeRunAbort.controller,
+                        sessionId: backingSessionId ?? clientRunId,
+                        sessionKey,
+                        agentId: selectedAgent.agentId,
+                        ownerConnId: normalizeOptionalText(client?.connId),
+                        ownerDeviceId: normalizeOptionalText(client?.connect?.device?.id),
+                      });
+                      return queuedFollowupEnqueued;
+                    },
+                    onCancellationRetired: () => {
+                      retireQueuedChatTurnCancellation(
+                        ensureChatQueuedTurns(context),
+                        clientRunId,
+                        activeRunAbort.controller,
+                      );
+                    },
+                    onSettled: () => {
+                      completeQueuedChatTurn(
+                        ensureChatQueuedTurns(context),
+                        clientRunId,
+                        activeRunAbort.controller,
+                      );
+                    },
+                  },
+                  images: replyOptionImages,
+                  imageOrder: imageOrder.length > 0 ? imageOrder : undefined,
+                  thinkingLevelOverride: p.thinking,
+                  fastModeOverride: p.fastMode,
+                  queueModeOverride: p.queueMode,
+                  userTurnTranscriptRecorder: userTurnRecorder,
+                  ...(restartSafeAdmission ? { suppressNextUserMessagePersistence: true } : {}),
+                  fastModeAutoOnSecondsOverride: p.fastAutoOnSeconds,
+                  onAgentRunStart: (runId) => {
+                    agentRunStarted = true;
+                    emitServerTiming(
+                      "agent-run-started",
+                      runId !== clientRunId ? { agentRunId: runId } : undefined,
+                      dispatchStartedAtMs,
+                    );
+                    const connId = typeof client?.connId === "string" ? client.connId : undefined;
+                    const wantsToolEvents = hasGatewayClientCap(
+                      client?.connect?.caps,
+                      GATEWAY_CLIENT_CAPS.TOOL_EVENTS,
+                    );
+                    if (connId && wantsToolEvents) {
+                      context.registerToolEventRecipient(runId, connId);
+                      // Register for any other active runs *in the same session* so
+                      // late-joining clients (e.g. page refresh mid-response) receive
+                      // in-progress tool events without leaking cross-session data.
+                      const defaultAgentId = resolveDefaultAgentId(cfg);
+                      const selectedGlobalAgentId =
+                        sessionKey === "global"
+                          ? (selectedAgent.agentId ?? defaultAgentId)
+                          : undefined;
+                      for (const [activeRunId, active] of context.chatAbortControllers) {
+                        const activeGlobalAgentId =
+                          active.sessionKey === "global"
+                            ? (active.agentId ?? defaultAgentId)
+                            : undefined;
+                        const sameSelectedGlobalAgent =
+                          sessionKey === "global" &&
+                          selectedGlobalAgentId !== undefined &&
+                          activeGlobalAgentId === selectedGlobalAgentId;
+                        const sameSession =
+                          active.sessionKey === sessionKey &&
+                          (sessionKey !== "global" || sameSelectedGlobalAgent);
+                        if (activeRunId !== runId && sameSession) {
+                          context.registerToolEventRecipient(activeRunId, connId);
+                        }
+                      }
+                    }
+                  },
+                  onModelSelected: (modelSelection) => {
+                    updateChatRunProvider(context.chatAbortControllers, {
+                      runId: clientRunId,
+                      providerId: modelSelection.provider,
+                      authProviderId: resolveProviderIdForAuth(modelSelection.provider, {
+                        config: cfg,
+                      }),
+                    });
+                    onModelSelected(modelSelection);
+                    emitServerTiming(
+                      "model-selected",
+                      {
+                        provider: modelSelection.provider,
+                        model: modelSelection.model,
+                      },
+                      dispatchStartedAtMs,
+                    );
+                  },
+                },
               });
-              if (appended.ok) {
-                message = appended.message;
-              } else {
-                context.logGateway.warn(
-                  `webchat transcript append failed: ${appended.error ?? "unknown error"}`,
-                );
-                const now = Date.now();
-                message = {
-                  role: "assistant",
-                  content: [{ type: "text", text: combinedReply }],
-                  timestamp: now,
-                  // Keep this compatible with Pi stopReason enums even though this message isn't
-                  // persisted to the transcript due to the append failure.
-                  stopReason: "stop",
-                  usage: { input: 0, output: 0, totalTokens: 0 },
-                };
+              if (dispatchResult.beforeAgentRunBlocked === true) {
+                userTurnRecorder.markBlocked();
               }
-            }
+              return dispatchResult;
+            },
+            {
+              phase: "agent-turn",
+              config: cfg,
+              attributes: chatSendTraceAttributes,
+            },
+          ),
+        )
+        .then(async () => {
+          emitServerTiming("dispatch-completed", undefined, dispatchStartedAtMs);
+          const postDispatchStartedAtMs = performance.now();
+          await measureDiagnosticsTimelineSpan(
+            "gateway.chat_send.post_dispatch",
+            async () => {
+              const returnedAgentErrorPayloads = agentRunStarted
+                ? deliveredReplies
+                    .map((entryInner) => entryInner.payload)
+                    .filter((payload) => payload.isError)
+                : [];
+              const returnedAgentErrorMessage =
+                returnedAgentErrorPayloads
+                  .map((payload) => payload.text?.trim())
+                  .filter((text): text is string => Boolean(text))
+                  .join(" | ") || undefined;
+              if (
+                agentRunStarted &&
+                returnedAgentErrorPayloads.length > 0 &&
+                !userTurnRecorder.hasPersisted() &&
+                !userTurnRecorder.isBlocked()
+              ) {
+                await persistGatewayUserTurnTranscriptBestEffort();
+              }
+              if (
+                agentRunStarted &&
+                returnedAgentErrorPayloads.length === 0 &&
+                !userTurnRecorder.hasPersisted() &&
+                !userTurnRecorder.isBlocked() &&
+                userTurnRecorder.hasRuntimePersistencePending()
+              ) {
+                await persistGatewayUserTurnTranscriptBestEffort();
+              }
+              let broadcastedSourceReplyFinal = false;
+              // WebChat persistence has two owners. Agent runs persist model-visible turns
+              // through OpenClaw runtime's SessionManager; this dispatcher only owns live delivery payloads.
+              // Do not blindly mirror agent-run final payloads into JSONL or chat.history can
+              // duplicate normal embedded-agent assistant turns. The non-agent branch below has no
+              // runtime-owned assistant turn, so it appends a gateway-injected assistant entry before
+              // broadcasting the final UI event.
+              if (!agentRunStarted && !queuedFollowupEnqueued) {
+                await finalizeChatSendNonAgentReplies({
+                  accountId,
+                  context,
+                  deliveredReplies,
+                  emitFirstAssistantServerTiming,
+                  foldCommandBlocks: isInternalTextSlashCommandTurn,
+                  persistUserTurnTranscript: persistGatewayUserTurnTranscriptBestEffort,
+                  session: preparedSession.value,
+                  suppressReplies: hasAppendedWebchatAgentMedia(),
+                });
+              } else {
+                broadcastedSourceReplyFinal = await finalizeChatSendSourceReplies({
+                  accountId,
+                  context,
+                  deliveredReplies,
+                  emitFirstAssistantServerTiming,
+                  hasReturnedAgentErrorPayloads: returnedAgentErrorPayloads.length > 0,
+                  session: preparedSession.value,
+                });
+              }
+              const shouldBroadcastAgentError =
+                returnedAgentErrorPayloads.length > 0 && !broadcastedSourceReplyFinal;
+              if (shouldBroadcastAgentError) {
+                broadcastChatError({
+                  context,
+                  runId: clientRunId,
+                  sessionKey,
+                  agentId,
+                  errorMessage: returnedAgentErrorMessage,
+                });
+              }
+              if (!context.chatAbortedRuns.has(clientRunId)) {
+                const returnedAgentError = shouldBroadcastAgentError
+                  ? errorShape(
+                      ErrorCodes.UNAVAILABLE,
+                      returnedAgentErrorMessage ?? "agent returned an error payload",
+                    )
+                  : undefined;
+                setGatewayDedupeEntry({
+                  dedupe: context.dedupe,
+                  key: `chat:${clientRunId}`,
+                  entry: {
+                    ts: Date.now(),
+                    ok: !shouldBroadcastAgentError,
+                    payload: shouldBroadcastAgentError
+                      ? {
+                          runId: clientRunId,
+                          status: "error" as const,
+                          summary: returnedAgentErrorMessage ?? "agent returned an error payload",
+                        }
+                      : { runId: clientRunId, status: "ok" as const },
+                    ...(returnedAgentError ? { error: returnedAgentError } : {}),
+                  },
+                });
+              }
+            },
+            {
+              phase: "agent-turn",
+              config: cfg,
+              attributes: chatSendTraceAttributes,
+            },
+          );
+          emitServerTiming(
+            "post-dispatch-completed",
+            {
+              postDispatchMs: roundedChatSendTimingMs(performance.now() - postDispatchStartedAtMs),
+            },
+            dispatchStartedAtMs,
+          );
+          if (queuedFollowupEnqueued && !context.chatAbortedRuns.has(clientRunId)) {
+            // Successful queue admission ends this client run. The later
+            // aggregate/followup owns its own run id.
             broadcastChatFinal({
               context,
               runId: clientRunId,
-              sessionKey: rawSessionKey,
-              message,
+              sessionKey,
+              agentId,
             });
           }
-          context.dedupe.set(`chat:${clientRunId}`, {
-            ts: Date.now(),
-            ok: true,
-            payload: { runId: clientRunId, status: "ok" as const },
-          });
         })
-        .catch((err) => {
-          const error = errorShape(ErrorCodes.UNAVAILABLE, String(err));
-          context.dedupe.set(`chat:${clientRunId}`, {
-            ts: Date.now(),
-            ok: false,
-            payload: {
-              runId: clientRunId,
-              status: "error" as const,
-              summary: String(err),
-            },
-            error,
-          });
-          broadcastChatError({
-            context,
-            runId: clientRunId,
-            sessionKey: rawSessionKey,
-            errorMessage: String(err),
-          });
-        })
-        .finally(() => {
-          context.chatAbortControllers.delete(clientRunId);
-        });
+        .catch(dispatchErrorLifecycle.handleError)
+        .finally(dispatchErrorLifecycle.finalize);
     } catch (err) {
+      if (restartSafeAdmission) {
+        const terminalized = await terminalizeRestartSafeAdmission({
+          retryable: true,
+          status: "failed",
+        }).catch((terminalizeError: unknown) => {
+          context.logGateway.warn(
+            `failed to release restart-safe chat admission after setup error: ${formatForLog(
+              terminalizeError,
+            )}`,
+          );
+          return false;
+        });
+        if (terminalized) {
+          emitSessionsChanged(context, {
+            sessionKey,
+            ...(agentId ? { agentId } : {}),
+            reason: "chat.dispatch-error",
+          });
+        }
+      }
+      cleanupAdmittedRun({ force: true });
+      clearAgentRunContext(clientRunId, lifecycleGeneration);
+      context.removeChatRun(clientRunId, clientRunId, sessionKey);
       const error = errorShape(ErrorCodes.UNAVAILABLE, String(err));
       const payload = {
         runId: clientRunId,
         status: "error" as const,
         summary: String(err),
       };
-      context.dedupe.set(`chat:${clientRunId}`, {
-        ts: Date.now(),
-        ok: false,
-        payload,
-        error,
+      setGatewayDedupeEntry({
+        dedupe: context.dedupe,
+        key: `chat:${clientRunId}`,
+        entry: {
+          ts: Date.now(),
+          ok: false,
+          payload,
+          error,
+        },
       });
       respond(false, payload, error, {
         runId: clientRunId,
         error: formatForLog(err),
+      });
+      broadcastChatError({
+        context,
+        runId: clientRunId,
+        sessionKey,
+        agentId,
+        errorMessage: String(err),
       });
     }
   },
@@ -994,28 +1606,86 @@ export const chatHandlers: GatewayRequestHandlers = {
     }
     const p = params as {
       sessionKey: string;
+      agentId?: string;
       message: string;
       label?: string;
     };
 
     // Load session to find transcript file
     const rawSessionKey = p.sessionKey;
-    const { cfg, storePath, entry } = loadSessionEntry(rawSessionKey);
+    const requestedAgentId = resolveRequestedChatAgentId({
+      cfg: (context as { getRuntimeConfig?: () => OpenClawConfig }).getRuntimeConfig?.(),
+      requestedSessionKey: rawSessionKey,
+      agentId: p.agentId,
+    });
+    const sessionLoadOptions = requestedAgentId ? { agentId: requestedAgentId } : undefined;
+    const {
+      cfg,
+      storePath,
+      entry,
+      canonicalKey: sessionKey,
+    } = loadSessionEntry(rawSessionKey, sessionLoadOptions);
+    const selectedAgent = validateChatSelectedAgent({
+      cfg,
+      requestedSessionKey: rawSessionKey,
+      agentId: requestedAgentId,
+    });
+    if (!selectedAgent.ok) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, selectedAgent.error));
+      return;
+    }
     const sessionId = entry?.sessionId;
     if (!sessionId || !storePath) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "session not found"));
       return;
     }
-
-    const appended = appendAssistantTranscriptMessage({
-      message: p.message,
-      label: p.label,
-      sessionId,
-      storePath,
-      sessionFile: entry?.sessionFile,
-      agentId: resolveSessionAgentId({ sessionKey: rawSessionKey, config: cfg }),
-      createIfMissing: false,
+    const agentId = resolveSessionAgentId({
+      sessionKey,
+      config: cfg,
+      agentId: selectedAgent.agentId,
     });
+
+    let appended: Awaited<ReturnType<typeof appendAssistantTranscriptMessage>>;
+    try {
+      const admission = await beginSessionWorkAdmission({
+        scope: storePath,
+        identities: [sessionKey, sessionId],
+        assertAllowed: () => {
+          const latestEntry = loadSessionEntry(rawSessionKey, sessionLoadOptions).entry;
+          if (!latestEntry) {
+            throw new Error(`Session "${sessionKey}" was deleted while starting work. Retry.`);
+          }
+          if (latestEntry.sessionId !== sessionId) {
+            throw new Error(`Session "${sessionKey}" changed while starting work. Retry.`);
+          }
+          const archivedError = resolveSessionWorkStartError(sessionKey, latestEntry);
+          if (archivedError) {
+            throw new Error(archivedError);
+          }
+        },
+      });
+      try {
+        appended = await admission.run(
+          async () =>
+            await appendAssistantTranscriptMessage({
+              sessionKey,
+              message: p.message,
+              label: p.label,
+              sessionId,
+              storePath,
+              sessionFile: entry.sessionFile,
+              agentId,
+              createIfMissing: true,
+              cfg,
+            }),
+        );
+      } finally {
+        admission.release();
+      }
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err)));
+      return;
+    }
     if (!appended.ok || !appended.messageId || !appended.message) {
       respond(
         false,
@@ -1029,18 +1699,27 @@ export const chatHandlers: GatewayRequestHandlers = {
     }
 
     // Broadcast to webchat for immediate UI update
+    const message = projectChatDisplayMessage(appended.message, {
+      maxChars: resolveEffectiveChatHistoryMaxChars(cfg),
+    });
     const chatPayload = {
       runId: `inject-${appended.messageId}`,
-      sessionKey: rawSessionKey,
+      sessionKey,
+      ...(sessionKey === "global" && agentId ? { agentId } : {}),
       seq: 0,
       state: "final" as const,
-      message: stripInlineDirectiveTagsFromMessageForDisplay(
-        stripEnvelopeFromMessage(appended.message) as Record<string, unknown>,
-      ),
+      message,
     };
     context.broadcast("chat", chatPayload);
-    context.nodeSendToSession(rawSessionKey, "chat", chatPayload);
+    sendGlobalAwareNodeChatPayload({
+      context,
+      sessionKey,
+      agentId,
+      event: "chat",
+      payload: chatPayload,
+    });
 
     respond(true, { ok: true, messageId: appended.messageId });
   },
 };
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

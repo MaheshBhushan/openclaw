@@ -1,80 +1,54 @@
-import OpenClawKit
 import Foundation
-import os
 import Testing
 @testable import OpenClaw
+@testable import OpenClawKit
 
-@Suite struct GatewayChannelShutdownTests {
-    private final class FakeWebSocketTask: WebSocketTasking, @unchecked Sendable {
-        private let connectRequestID = OSAllocatedUnfairLock<String?>(initialState: nil)
-        private let pendingReceiveHandler =
-            OSAllocatedUnfairLock<(@Sendable (Result<URLSessionWebSocketTask.Message, Error>)
-                    -> Void)?>(initialState: nil)
-        private let cancelCount = OSAllocatedUnfairLock(initialState: 0)
+private actor GatewayHandshakeGate {
+    private var started = false
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
 
-        var state: URLSessionTask.State = .suspended
-
-        func snapshotCancelCount() -> Int { self.cancelCount.withLock { $0 } }
-
-        func resume() {
-            self.state = .running
-        }
-
-        func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-            _ = (closeCode, reason)
-            self.state = .canceling
-            self.cancelCount.withLock { $0 += 1 }
-            let handler = self.pendingReceiveHandler.withLock { handler in
-                defer { handler = nil }
-                return handler
-            }
-            handler?(Result<URLSessionWebSocketTask.Message, Error>.failure(URLError(.cancelled)))
-        }
-
-        func send(_ message: URLSessionWebSocketTask.Message) async throws {
-            if let id = GatewayWebSocketTestSupport.connectRequestID(from: message) {
-                self.connectRequestID.withLock { $0 = id }
-            }
-        }
-
-        func receive() async throws -> URLSessionWebSocketTask.Message {
-            let id = self.connectRequestID.withLock { $0 } ?? "connect"
-            return .data(GatewayWebSocketTestSupport.connectOkData(id: id))
-        }
-
-        func receive(
-            completionHandler: @escaping @Sendable (Result<URLSessionWebSocketTask.Message, Error>) -> Void)
-        {
-            self.pendingReceiveHandler.withLock { $0 = completionHandler }
-        }
-
-        func triggerReceiveFailure() {
-            let handler = self.pendingReceiveHandler.withLock { $0 }
-            handler?(Result<URLSessionWebSocketTask.Message, Error>.failure(URLError(.networkConnectionLost)))
-        }
-
-    }
-
-    private final class FakeWebSocketSession: WebSocketSessioning, @unchecked Sendable {
-        private let makeCount = OSAllocatedUnfairLock(initialState: 0)
-        private let tasks = OSAllocatedUnfairLock(initialState: [FakeWebSocketTask]())
-
-        func snapshotMakeCount() -> Int { self.makeCount.withLock { $0 } }
-        func latestTask() -> FakeWebSocketTask? { self.tasks.withLock { $0.last } }
-
-        func makeWebSocketTask(url: URL) -> WebSocketTaskBox {
-            _ = url
-            self.makeCount.withLock { $0 += 1 }
-            let task = FakeWebSocketTask()
-            self.tasks.withLock { $0.append(task) }
-            return WebSocketTaskBox(task: task)
+    func wait() async {
+        self.started = true
+        guard !self.released else { return }
+        await withCheckedContinuation { continuation in
+            self.waiters.append(continuation)
         }
     }
 
-    @Test func shutdownPreventsReconnectLoopFromReceiveFailure() async throws {
-        let session = FakeWebSocketSession()
-        let channel = GatewayChannelActor(
-            url: URL(string: "ws://example.invalid")!,
+    func hasStarted() -> Bool {
+        self.started
+    }
+
+    func release() {
+        self.released = true
+        let waiters = self.waiters
+        self.waiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+}
+
+private actor GatewaySnapshotProbe {
+    private var count = 0
+
+    func record(_ push: GatewayPush) {
+        if case .snapshot = push {
+            self.count += 1
+        }
+    }
+
+    func value() -> Int {
+        self.count
+    }
+}
+
+struct GatewayChannelShutdownTests {
+    @Test func `shutdown prevents reconnect loop from receive failure`() async throws {
+        let session = GatewayTestWebSocketSession()
+        let channel = try GatewayChannelActor(
+            url: #require(URL(string: "ws://example.invalid")),
             token: nil,
             session: WebSocketSessionBox(session: session))
 
@@ -83,7 +57,7 @@ import Testing
         #expect(session.snapshotMakeCount() == 1)
 
         // Simulate a socket receive failure, which would normally schedule a reconnect.
-        session.latestTask()?.triggerReceiveFailure()
+        session.latestTask()?.emitReceiveFailure()
 
         // Shut down quickly, before backoff reconnect triggers.
         await channel.shutdown()
@@ -92,5 +66,53 @@ import Testing
         try? await Task.sleep(nanoseconds: 750 * 1_000_000)
 
         #expect(session.snapshotMakeCount() == 1)
+    }
+
+    @Test func `shutdown rejects a buffered handshake before applying hello state`() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try await DeviceIdentityStore.withStateDirectory(tempDir) {
+            let identity = DeviceIdentityStore.loadOrCreate()
+            let responseGate = GatewayHandshakeGate()
+            let snapshots = GatewaySnapshotProbe()
+            let session = GatewayTestWebSocketSession(taskFactory: {
+                GatewayTestWebSocketTask(receiveHook: { task, receiveIndex in
+                    if receiveIndex == 0 {
+                        return .data(GatewayWebSocketTestSupport.connectChallengeData())
+                    }
+                    await responseGate.wait()
+                    let id = task.snapshotConnectRequestID() ?? "connect"
+                    return .data(GatewayWebSocketTestSupport.connectOkData(
+                        id: id,
+                        tickIntervalMs: 1,
+                        deviceToken: "stale-device-token"))
+                })
+            })
+            let channel = try GatewayChannelActor(
+                url: #require(URL(string: "ws://example.invalid")),
+                token: nil,
+                session: WebSocketSessionBox(session: session),
+                pushHandler: { push, _ in await snapshots.record(push) })
+
+            let connect = Task { try await channel.connect() }
+            for _ in 0..<100 {
+                if await responseGate.hasStarted() { break }
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+            #expect(await responseGate.hasStarted())
+
+            await channel.shutdown()
+            await responseGate.release()
+
+            await #expect(throws: (any Error).self) {
+                try await connect.value
+            }
+            #expect(await channel.currentIssuedDeviceAuthRoles().isEmpty)
+            #expect(DeviceAuthStore.loadToken(deviceId: identity.deviceId, role: "operator") == nil)
+            #expect(await snapshots.value() == 0)
+        }
     }
 }

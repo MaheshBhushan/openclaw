@@ -1,24 +1,15 @@
-import { format } from "node:util";
-import type { RuntimeEnv } from "../runtime.js";
+/**
+ * Public SDK subpath for runtime logging, env, backup, and process helpers.
+ */
+export type { OutputRuntimeEnv, RuntimeEnv } from "../runtime.js";
+export { defaultRuntime } from "../runtime.js";
+export { createNonExitingRuntime } from "../runtime.js";
+export { resolveCommandSecretRefsViaGateway } from "../cli/command-secret-gateway.js";
+export { getChannelsCommandSecretTargetIds } from "../cli/command-secret-targets.js";
+export { createLoggerBackedRuntime, resolveRuntimeEnv } from "./runtime-logger.js";
 
-type LoggerLike = {
-  info: (message: string) => void;
-  error: (message: string) => void;
-};
-
-export function createLoggerBackedRuntime(params: {
-  logger: LoggerLike;
-  exitError?: (code: number) => Error;
-}): RuntimeEnv {
-  return {
-    log: (...args) => {
-      params.logger.info(format(...args));
-    },
-    error: (...args) => {
-      params.logger.error(format(...args));
-    },
-    exit: (code: number): never => {
-      throw params.exitError?.(code) ?? new Error(`exit ${code}`);
-    },
-  };
-}
+export { waitForAbortSignal } from "../infra/abort-signal.js";
+export {
+  registerUncaughtExceptionHandler,
+  registerUnhandledRejectionHandler,
+} from "../infra/unhandled-rejections.js";

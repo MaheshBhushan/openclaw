@@ -1,14 +1,26 @@
+// Daemon runtime path tests cover executable and config path resolution.
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const fsMocks = vi.hoisted(() => ({
   access: vi.fn(),
+  realpath: vi.fn(),
 }));
 
-vi.mock("node:fs/promises", () => ({
-  default: { access: fsMocks.access },
-  access: fsMocks.access,
-}));
+vi.mock("node:fs/promises", async () => {
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  return {
+    ...actual,
+    default: {
+      ...actual,
+      access: fsMocks.access,
+      realpath: fsMocks.realpath,
+    },
+    access: fsMocks.access,
+    realpath: fsMocks.realpath,
+  };
+});
 
+import { resolveStableNodePath } from "../infra/stable-node-path.js";
 import {
   renderSystemNodeWarning,
   resolvePreferredNodePath,
@@ -19,23 +31,143 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
-function mockNodePathPresent(nodePath: string) {
+function mockNodeRealpath(realpaths: Record<string, string> = {}) {
+  fsMocks.realpath.mockImplementation(async (target: string) => realpaths[target] ?? target);
+}
+
+function mockNodePathPresent(...nodePaths: string[]) {
+  mockNodeRealpath();
   fsMocks.access.mockImplementation(async (target: string) => {
-    if (target === nodePath) {
+    if (nodePaths.includes(target)) {
       return;
     }
     throw new Error("missing");
   });
 }
 
+function nodeRuntime(nodeVersion: string, sqliteVersion: string | null = "3.51.3") {
+  return {
+    stdout: `${JSON.stringify({ nodeVersion, sqliteVersion })}\n`,
+    stderr: "",
+  };
+}
+
 describe("resolvePreferredNodePath", () => {
   const darwinNode = "/opt/homebrew/bin/node";
-  const fnmNode = "/Users/test/.fnm/node-versions/v24.11.1/installation/bin/node";
+  const fnmNode = "/Users/test/.fnm/node-versions/v24.15.0/installation/bin/node";
+  const linuxSystemNode = "/usr/bin/node";
+  const nvmNode = "/home/test/.nvm/versions/node/v24.15.0/bin/node";
 
-  it("prefers execPath (version manager node) over system node", async () => {
+  it("prefers supported system node over version-manager execPath", async () => {
     mockNodePathPresent(darwinNode);
 
-    const execFile = vi.fn().mockResolvedValue({ stdout: "24.11.1\n", stderr: "" });
+    const execFile = vi
+      .fn()
+      .mockResolvedValueOnce(nodeRuntime("24.15.0"))
+      .mockResolvedValueOnce(nodeRuntime("24.15.0"));
+
+    const result = await resolvePreferredNodePath({
+      env: {},
+      runtime: "node",
+      platform: "darwin",
+      execFile,
+      execPath: fnmNode,
+    });
+
+    expect(result).toBe(darwinNode);
+    expect(execFile).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses system node for Linux service installs instead of nvm execPath", async () => {
+    mockNodePathPresent(linuxSystemNode);
+
+    const execFile = vi
+      .fn()
+      .mockResolvedValueOnce(nodeRuntime("24.15.0"))
+      .mockResolvedValueOnce(nodeRuntime("24.15.0"));
+
+    const result = await resolvePreferredNodePath({
+      env: {},
+      runtime: "node",
+      platform: "linux",
+      execFile,
+      execPath: nvmNode,
+    });
+
+    expect(result).toBe(linuxSystemNode);
+    expect(execFile).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses system node for Linux service installs instead of default fnm execPath", async () => {
+    const linuxFnmNode = "/home/test/.local/share/fnm/aliases/default/bin/node";
+    mockNodePathPresent(linuxSystemNode);
+
+    const execFile = vi
+      .fn()
+      .mockResolvedValueOnce(nodeRuntime("24.15.0"))
+      .mockResolvedValueOnce(nodeRuntime("24.15.0"));
+
+    const result = await resolvePreferredNodePath({
+      env: {},
+      runtime: "node",
+      platform: "linux",
+      execFile,
+      execPath: linuxFnmNode,
+    });
+
+    expect(result).toBe(linuxSystemNode);
+    expect(execFile).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses system node for macOS service installs instead of default fnm execPath", async () => {
+    const darwinFnmNode = "/Users/test/Library/Application Support/fnm/aliases/default/bin/node";
+    mockNodePathPresent(darwinNode);
+
+    const execFile = vi
+      .fn()
+      .mockResolvedValueOnce(nodeRuntime("24.15.0"))
+      .mockResolvedValueOnce(nodeRuntime("24.15.0"));
+
+    const result = await resolvePreferredNodePath({
+      env: {},
+      runtime: "node",
+      platform: "darwin",
+      execFile,
+      execPath: darwinFnmNode,
+    });
+
+    expect(result).toBe(darwinNode);
+    expect(execFile).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses Homebrew opt Node when a version-manager execPath is active", async () => {
+    const homebrewOptNode = "/opt/homebrew/opt/node@22/bin/node";
+    mockNodePathPresent(homebrewOptNode);
+
+    const execFile = vi
+      .fn()
+      .mockResolvedValueOnce(nodeRuntime("24.15.0"))
+      .mockResolvedValueOnce(nodeRuntime("22.22.3"));
+
+    const result = await resolvePreferredNodePath({
+      env: {},
+      runtime: "node",
+      platform: "darwin",
+      execFile,
+      execPath: fnmNode,
+    });
+
+    expect(result).toBe(homebrewOptNode);
+    expect(execFile).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to version-manager execPath when no supported system node exists", async () => {
+    mockNodePathPresent(darwinNode);
+
+    const execFile = vi
+      .fn()
+      .mockResolvedValueOnce(nodeRuntime("24.15.0"))
+      .mockResolvedValueOnce(nodeRuntime("18.0.0", null));
 
     const result = await resolvePreferredNodePath({
       env: {},
@@ -46,7 +178,7 @@ describe("resolvePreferredNodePath", () => {
     });
 
     expect(result).toBe(fnmNode);
-    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(execFile).toHaveBeenCalledTimes(2);
   });
 
   it("falls back to system node when execPath version is unsupported", async () => {
@@ -54,8 +186,8 @@ describe("resolvePreferredNodePath", () => {
 
     const execFile = vi
       .fn()
-      .mockResolvedValueOnce({ stdout: "18.0.0\n", stderr: "" }) // execPath too old
-      .mockResolvedValueOnce({ stdout: "22.12.0\n", stderr: "" }); // system node ok
+      .mockResolvedValueOnce(nodeRuntime("18.0.0", null)) // execPath too old
+      .mockResolvedValueOnce(nodeRuntime("22.22.3")); // system node ok
 
     const result = await resolvePreferredNodePath({
       env: {},
@@ -72,7 +204,7 @@ describe("resolvePreferredNodePath", () => {
   it("ignores execPath when it is not node", async () => {
     mockNodePathPresent(darwinNode);
 
-    const execFile = vi.fn().mockResolvedValue({ stdout: "22.12.0\n", stderr: "" });
+    const execFile = vi.fn().mockResolvedValue(nodeRuntime("22.22.3"));
 
     const result = await resolvePreferredNodePath({
       env: {},
@@ -84,16 +216,18 @@ describe("resolvePreferredNodePath", () => {
 
     expect(result).toBe(darwinNode);
     expect(execFile).toHaveBeenCalledTimes(1);
-    expect(execFile).toHaveBeenCalledWith(darwinNode, ["-p", "process.versions.node"], {
-      encoding: "utf8",
-    });
+    expect(execFile).toHaveBeenCalledWith(
+      darwinNode,
+      ["-e", expect.stringContaining("SELECT sqlite_version() AS version")],
+      { encoding: "utf8", timeoutMs: 5_000 },
+    );
   });
 
   it("uses system node when it meets the minimum version", async () => {
     mockNodePathPresent(darwinNode);
 
-    // Node 22.12.0+ is the minimum required version
-    const execFile = vi.fn().mockResolvedValue({ stdout: "22.12.0\n", stderr: "" });
+    // Node 22.22.3+ is the minimum required version
+    const execFile = vi.fn().mockResolvedValue(nodeRuntime("22.22.3"));
 
     const result = await resolvePreferredNodePath({
       env: {},
@@ -110,8 +244,8 @@ describe("resolvePreferredNodePath", () => {
   it("skips system node when it is too old", async () => {
     mockNodePathPresent(darwinNode);
 
-    // Node 22.11.x is below minimum 22.12.0
-    const execFile = vi.fn().mockResolvedValue({ stdout: "22.11.0\n", stderr: "" });
+    // Node 22.22.2 is below minimum 22.22.3
+    const execFile = vi.fn().mockResolvedValue(nodeRuntime("22.22.2", null));
 
     const result = await resolvePreferredNodePath({
       env: {},
@@ -123,6 +257,44 @@ describe("resolvePreferredNodePath", () => {
 
     expect(result).toBeUndefined();
     expect(execFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a safe version-manager runtime when system SQLite is unsafe", async () => {
+    mockNodePathPresent(linuxSystemNode);
+
+    const execFile = vi
+      .fn()
+      .mockResolvedValueOnce(nodeRuntime("24.15.0", "3.51.3"))
+      .mockResolvedValueOnce(nodeRuntime("24.17.0", "3.51.2"));
+
+    const result = await resolvePreferredNodePath({
+      env: {},
+      runtime: "node",
+      platform: "linux",
+      execFile,
+      execPath: nvmNode,
+    });
+
+    expect(result).toBe(nvmNode);
+  });
+
+  it("falls back to safe system SQLite when the current runtime is unsafe", async () => {
+    mockNodePathPresent(linuxSystemNode);
+
+    const execFile = vi
+      .fn()
+      .mockResolvedValueOnce(nodeRuntime("24.17.0", "3.51.2"))
+      .mockResolvedValueOnce(nodeRuntime("24.15.0", "3.51.3"));
+
+    const result = await resolvePreferredNodePath({
+      env: {},
+      runtime: "node",
+      platform: "linux",
+      execFile,
+      execPath: nvmNode,
+    });
+
+    expect(result).toBe(linuxSystemNode);
   });
 
   it("returns undefined when no system node is found", async () => {
@@ -142,14 +314,83 @@ describe("resolvePreferredNodePath", () => {
   });
 });
 
+describe("resolveStableNodePath", () => {
+  it("resolves Homebrew Cellar path to opt symlink", async () => {
+    mockNodePathPresent("/opt/homebrew/opt/node/bin/node");
+
+    const result = await resolveStableNodePath("/opt/homebrew/Cellar/node/25.9.0/bin/node");
+    expect(result).toBe("/opt/homebrew/opt/node/bin/node");
+  });
+
+  it("falls back to bin symlink for default node formula", async () => {
+    mockNodePathPresent("/opt/homebrew/bin/node");
+
+    const result = await resolveStableNodePath("/opt/homebrew/Cellar/node/25.9.0/bin/node");
+    expect(result).toBe("/opt/homebrew/bin/node");
+  });
+
+  it("resolves Intel Mac Cellar path to opt symlink", async () => {
+    mockNodePathPresent("/usr/local/opt/node/bin/node");
+
+    const result = await resolveStableNodePath("/usr/local/Cellar/node/25.9.0/bin/node");
+    expect(result).toBe("/usr/local/opt/node/bin/node");
+  });
+
+  it("resolves versioned node@22 formula to opt symlink", async () => {
+    mockNodePathPresent("/opt/homebrew/opt/node@22/bin/node");
+
+    const result = await resolveStableNodePath("/opt/homebrew/Cellar/node@22/22.22.3/bin/node");
+    expect(result).toBe("/opt/homebrew/opt/node@22/bin/node");
+  });
+
+  it("returns original path when no stable symlink exists", async () => {
+    fsMocks.access.mockRejectedValue(new Error("missing"));
+
+    const cellarPath = "/opt/homebrew/Cellar/node/25.9.0/bin/node";
+    const result = await resolveStableNodePath(cellarPath);
+    expect(result).toBe(cellarPath);
+  });
+
+  it("returns non-Cellar paths unchanged", async () => {
+    const fnmPath = "/Users/test/.fnm/node-versions/v24.15.0/installation/bin/node";
+    const result = await resolveStableNodePath(fnmPath);
+    expect(result).toBe(fnmPath);
+  });
+
+  it("returns system paths unchanged", async () => {
+    const result = await resolveStableNodePath("/opt/homebrew/bin/node");
+    expect(result).toBe("/opt/homebrew/bin/node");
+  });
+});
+
+describe("resolvePreferredNodePath — Homebrew Cellar", () => {
+  it("resolves Cellar execPath to stable Homebrew symlink", async () => {
+    const cellarNode = "/opt/homebrew/Cellar/node/25.9.0/bin/node";
+    const stableNode = "/opt/homebrew/opt/node/bin/node";
+    mockNodePathPresent(stableNode);
+
+    const execFile = vi.fn().mockResolvedValue(nodeRuntime("25.9.0"));
+
+    const result = await resolvePreferredNodePath({
+      env: {},
+      runtime: "node",
+      platform: "darwin",
+      execFile,
+      execPath: cellarNode,
+    });
+
+    expect(result).toBe(stableNode);
+  });
+});
+
 describe("resolveSystemNodeInfo", () => {
   const darwinNode = "/opt/homebrew/bin/node";
 
   it("returns supported info when version is new enough", async () => {
     mockNodePathPresent(darwinNode);
 
-    // Node 22.12.0+ is the minimum required version
-    const execFile = vi.fn().mockResolvedValue({ stdout: "22.12.0\n", stderr: "" });
+    // Node 22.22.3+ is the minimum required version
+    const execFile = vi.fn().mockResolvedValue(nodeRuntime("22.22.3"));
 
     const result = await resolveSystemNodeInfo({
       env: {},
@@ -159,7 +400,8 @@ describe("resolveSystemNodeInfo", () => {
 
     expect(result).toEqual({
       path: darwinNode,
-      version: "22.12.0",
+      sqliteVersion: "3.51.3",
+      version: "22.22.3",
       supported: true,
     });
   });
@@ -171,17 +413,137 @@ describe("resolveSystemNodeInfo", () => {
     expect(result).toBeNull();
   });
 
+  it("continues past an old system node to find a supported candidate", async () => {
+    const homebrewOptNode = "/opt/homebrew/opt/node@22/bin/node";
+    mockNodePathPresent(darwinNode, homebrewOptNode);
+
+    const execFile = vi
+      .fn()
+      .mockResolvedValueOnce(nodeRuntime("18.0.0", null))
+      .mockResolvedValueOnce(nodeRuntime("22.22.3"));
+
+    const result = await resolveSystemNodeInfo({
+      env: {},
+      platform: "darwin",
+      execFile,
+    });
+
+    expect(result).toEqual({
+      path: homebrewOptNode,
+      sqliteVersion: "3.51.3",
+      version: "22.22.3",
+      supported: true,
+    });
+  });
+
+  it("skips system-node candidates that resolve into version-manager paths", async () => {
+    const homebrewOptNode = "/opt/homebrew/opt/node@22/bin/node";
+    mockNodePathPresent(darwinNode, homebrewOptNode);
+    mockNodeRealpath({
+      [darwinNode]: "/Users/test/.nvm/versions/node/v24.14.1/bin/node",
+      [homebrewOptNode]: homebrewOptNode,
+    });
+
+    const execFile = vi.fn().mockResolvedValue(nodeRuntime("24.15.0"));
+
+    const result = await resolveSystemNodeInfo({
+      env: {},
+      platform: "darwin",
+      execFile,
+    });
+
+    expect(result).toEqual({
+      path: homebrewOptNode,
+      sqliteVersion: "3.51.3",
+      version: "24.15.0",
+      supported: true,
+    });
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(execFile).toHaveBeenCalledWith(
+      homebrewOptNode,
+      ["-e", expect.stringContaining("SELECT sqlite_version() AS version")],
+      { encoding: "utf8", timeoutMs: 5_000 },
+    );
+  });
+
+  it("returns null when every system-node candidate resolves into a version manager", async () => {
+    mockNodePathPresent(darwinNode);
+    mockNodeRealpath({
+      [darwinNode]: "/Users/test/Library/Application Support/fnm/aliases/default/bin/node",
+    });
+
+    const execFile = vi.fn();
+
+    const result = await resolveSystemNodeInfo({
+      env: {},
+      platform: "darwin",
+      execFile,
+    });
+
+    expect(result).toBeNull();
+    expect(execFile).not.toHaveBeenCalled();
+  });
+
   it("renders a warning when system node is too old", () => {
     const warning = renderSystemNodeWarning(
       {
         path: darwinNode,
+        sqliteVersion: null,
         version: "18.19.0",
         supported: false,
       },
       "/Users/me/.fnm/node-22/bin/node",
     );
 
-    expect(warning).toContain("below the required Node 22+");
+    expect(warning).toContain("outside the supported range");
     expect(warning).toContain(darwinNode);
+  });
+
+  it("renders a WAL safety warning for supported Node with unsafe SQLite", () => {
+    const warning = renderSystemNodeWarning({
+      path: darwinNode,
+      sqliteVersion: "3.51.2",
+      version: "24.17.0",
+      supported: false,
+    });
+
+    expect(warning).toContain("uses SQLite 3.51.2");
+    expect(warning).toContain("not WAL-reset-safe");
+  });
+
+  it("uses validated custom Program Files roots on Windows", async () => {
+    const customNode = "D:\\Programs\\nodejs\\node.exe";
+    mockNodePathPresent(customNode);
+
+    const execFile = vi.fn().mockResolvedValue(nodeRuntime("24.15.0"));
+    const result = await resolveSystemNodeInfo({
+      env: {
+        ProgramFiles: "D:\\Programs",
+        "ProgramFiles(x86)": "E:\\Programs (x86)",
+      },
+      platform: "win32",
+      execFile,
+    });
+
+    expect(result?.path).toBe(customNode);
+  });
+
+  it("prefers ProgramW6432 over ProgramFiles on Windows", async () => {
+    const preferredNode = "D:\\Programs\\nodejs\\node.exe";
+    const x86Node = "E:\\Programs (x86)\\nodejs\\node.exe";
+    mockNodePathPresent(preferredNode, x86Node);
+
+    const execFile = vi.fn().mockResolvedValue(nodeRuntime("24.15.0"));
+    const result = await resolveSystemNodeInfo({
+      env: {
+        ProgramFiles: "E:\\Programs (x86)",
+        "ProgramFiles(x86)": "E:\\Programs (x86)",
+        ProgramW6432: "D:\\Programs",
+      },
+      platform: "win32",
+      execFile,
+    });
+
+    expect(result?.path).toBe(preferredNode);
   });
 });

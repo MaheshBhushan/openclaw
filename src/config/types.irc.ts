@@ -1,8 +1,9 @@
+// Defines IRC channel configuration types.
 import type { CommonChannelMessagingConfig } from "./types.channel-messaging-common.js";
 import type { GroupToolPolicyBySenderConfig, GroupToolPolicyConfig } from "./types.tools.js";
 
 export type IrcAccountConfig = CommonChannelMessagingConfig & {
-  /** IRC server hostname (example: irc.libera.chat). */
+  /** IRC server hostname (example: irc.example.com). */
   host?: string;
   /** IRC server port (default: 6697 with TLS, otherwise 6667). */
   port?: number;
@@ -56,4 +57,6 @@ export type IrcAccountConfig = CommonChannelMessagingConfig & {
 export type IrcConfig = {
   /** Optional per-account IRC configuration (multi-account). */
   accounts?: Record<string, IrcAccountConfig>;
+  /** Optional default account id when multiple accounts are configured. */
+  defaultAccount?: string;
 } & IrcAccountConfig;

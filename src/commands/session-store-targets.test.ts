@@ -1,79 +1,58 @@
+// Session store target tests cover session-store path resolution for command surfaces.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveSessionStoreTargets } from "./session-store-targets.js";
+import type { RuntimeEnv } from "../runtime.js";
+import { resolveSessionStoreTargetsOrExit } from "./session-store-targets.js";
 
-const resolveStorePathMock = vi.hoisted(() => vi.fn());
-const resolveDefaultAgentIdMock = vi.hoisted(() => vi.fn());
-const listAgentIdsMock = vi.hoisted(() => vi.fn());
+const resolveSessionStoreTargetsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../config/sessions.js", () => ({
-  resolveStorePath: resolveStorePathMock,
+  resolveSessionStoreTargets: resolveSessionStoreTargetsMock,
 }));
 
-vi.mock("../agents/agent-scope.js", () => ({
-  resolveDefaultAgentId: resolveDefaultAgentIdMock,
-  listAgentIds: listAgentIdsMock,
-}));
+function createRuntime(): RuntimeEnv {
+  return {
+    log: vi.fn(),
+    error: vi.fn(),
+    exit: vi.fn(),
+  };
+}
 
-describe("resolveSessionStoreTargets", () => {
+describe("resolveSessionStoreTargetsOrExit", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("resolves the default agent store when no selector is provided", () => {
-    resolveDefaultAgentIdMock.mockReturnValue("main");
-    resolveStorePathMock.mockReturnValue("/tmp/main-sessions.json");
+  it("returns targets from the shared config helper", () => {
+    resolveSessionStoreTargetsMock.mockReturnValue([
+      { agentId: "main", storePath: "/tmp/main-sessions.json" },
+    ]);
+    const runtime = createRuntime();
 
-    const targets = resolveSessionStoreTargets({}, {});
+    const targets = resolveSessionStoreTargetsOrExit({
+      cfg: {},
+      opts: {},
+      runtime,
+    });
 
     expect(targets).toEqual([{ agentId: "main", storePath: "/tmp/main-sessions.json" }]);
-    expect(resolveStorePathMock).toHaveBeenCalledWith(undefined, { agentId: "main" });
+    expect(resolveSessionStoreTargetsMock).toHaveBeenCalledWith({}, {});
+    expect(runtime.exit).not.toHaveBeenCalled();
   });
 
-  it("resolves all configured agent stores", () => {
-    listAgentIdsMock.mockReturnValue(["main", "work"]);
-    resolveStorePathMock
-      .mockReturnValueOnce("/tmp/main-sessions.json")
-      .mockReturnValueOnce("/tmp/work-sessions.json");
+  it("reports resolution errors and exits the command", () => {
+    resolveSessionStoreTargetsMock.mockImplementation(() => {
+      throw new Error("Unknown agent id: ghost");
+    });
+    const runtime = createRuntime();
 
-    const targets = resolveSessionStoreTargets(
-      {
-        session: { store: "~/.openclaw/agents/{agentId}/sessions/sessions.json" },
-      },
-      { allAgents: true },
-    );
+    const targets = resolveSessionStoreTargetsOrExit({
+      cfg: {},
+      opts: { agent: "ghost" },
+      runtime,
+    });
 
-    expect(targets).toEqual([
-      { agentId: "main", storePath: "/tmp/main-sessions.json" },
-      { agentId: "work", storePath: "/tmp/work-sessions.json" },
-    ]);
-  });
-
-  it("dedupes shared store paths for --all-agents", () => {
-    listAgentIdsMock.mockReturnValue(["main", "work"]);
-    resolveStorePathMock.mockReturnValue("/tmp/shared-sessions.json");
-
-    const targets = resolveSessionStoreTargets(
-      {
-        session: { store: "/tmp/shared-sessions.json" },
-      },
-      { allAgents: true },
-    );
-
-    expect(targets).toEqual([{ agentId: "main", storePath: "/tmp/shared-sessions.json" }]);
-    expect(resolveStorePathMock).toHaveBeenCalledTimes(2);
-  });
-
-  it("rejects unknown agent ids", () => {
-    listAgentIdsMock.mockReturnValue(["main", "work"]);
-    expect(() => resolveSessionStoreTargets({}, { agent: "ghost" })).toThrow(/Unknown agent id/);
-  });
-
-  it("rejects conflicting selectors", () => {
-    expect(() => resolveSessionStoreTargets({}, { agent: "main", allAgents: true })).toThrow(
-      /cannot be used together/i,
-    );
-    expect(() =>
-      resolveSessionStoreTargets({}, { store: "/tmp/sessions.json", allAgents: true }),
-    ).toThrow(/cannot be combined/i);
+    expect(targets).toBeNull();
+    expect(runtime.error).toHaveBeenCalledWith("Unknown agent id: ghost");
+    expect(runtime.exit).toHaveBeenCalledWith(1);
   });
 });

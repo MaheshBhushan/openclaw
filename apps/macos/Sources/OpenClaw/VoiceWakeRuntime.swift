@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import OpenClawKit
 import OSLog
 import Speech
 import SwabbleKit
@@ -10,8 +11,6 @@ import AppKit
 /// Background listener that keeps the voice-wake pipeline alive outside the settings test view.
 actor VoiceWakeRuntime {
     static let shared = VoiceWakeRuntime()
-
-    enum ListeningState { case idle, voiceWake, pushToTalk }
 
     private let logger = Logger(subsystem: "ai.openclaw", category: "voicewake.runtime")
 
@@ -34,9 +33,9 @@ actor VoiceWakeRuntime {
     private var volatileTranscript: String = ""
     private var cooldownUntil: Date?
     private var currentConfig: RuntimeConfig?
-    private var listeningState: ListeningState = .idle
     private var overlayToken: UUID?
     private var activeTriggerEndTime: TimeInterval?
+    private var activeTriggerWord: String?
     private var scheduledRestartTask: Task<Void, Never>?
     private var lastLoggedText: String?
     private var lastLoggedAt: Date?
@@ -82,6 +81,7 @@ actor VoiceWakeRuntime {
         let localeID: String?
         let triggerChime: VoiceWakeChime
         let sendChime: VoiceWakeChime
+        let triggersTalkMode: Bool
     }
 
     private struct RecognitionUpdate {
@@ -100,7 +100,8 @@ actor VoiceWakeRuntime {
                 micID: state.voiceWakeMicID.isEmpty ? nil : state.voiceWakeMicID,
                 localeID: state.voiceWakeLocaleID.isEmpty ? nil : state.voiceWakeLocaleID,
                 triggerChime: state.voiceWakeTriggerChime,
-                sendChime: state.voiceWakeSendChime)
+                sendChime: state.voiceWakeSendChime,
+                triggersTalkMode: state.voiceWakeTriggersTalkMode)
             return (enabled, config)
         }
 
@@ -117,9 +118,7 @@ actor VoiceWakeRuntime {
 
         let config = snapshot.1
 
-        if self.isStarting {
-            return
-        }
+        if self.isStarting { return }
 
         if self.scheduledRestartTask != nil, config == self.currentConfig, self.recognitionTask == nil {
             return
@@ -139,9 +138,7 @@ actor VoiceWakeRuntime {
     }
 
     private func start(with config: RuntimeConfig) async {
-        if self.isStarting {
-            return
-        }
+        if self.isStarting { return }
         self.isStarting = true
         defer { self.isStarting = false }
         do {
@@ -184,8 +181,8 @@ actor VoiceWakeRuntime {
             }
             input.removeTap(onBus: 0)
             input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self, weak request] buffer, _ in
-                request?.append(buffer)
-                guard let rms = Self.rmsLevel(buffer: buffer) else { return }
+                request?.append(SpeechAudioBufferNormalizer.speechCompatibleBuffer(from: buffer))
+                let rms = TalkAudioLevel.rms(buffer: buffer)
                 Task.detached { [weak self] in
                     await self?.noteAudioLevel(rms: rms)
                     await self?.noteAudioTap(rms: rms)
@@ -252,8 +249,8 @@ actor VoiceWakeRuntime {
         self.haltRecognitionPipeline()
         self.recognizer = nil
         self.currentConfig = nil
-        self.listeningState = .idle
         self.activeTriggerEndTime = nil
+        self.activeTriggerWord = nil
         self.logger.debug("voicewake runtime stopped")
         DiagnosticsFileLog.shared.log(category: "voicewake.runtime", event: "stopped")
 
@@ -312,10 +309,12 @@ actor VoiceWakeRuntime {
                     self.committedTranscript = trimmed
                     self.volatileTranscript = ""
                 } else {
-                    self.volatileTranscript = Self.delta(after: self.committedTranscript, current: trimmed)
+                    self.volatileTranscript = VoiceOverlayTextFormatting.delta(
+                        after: self.committedTranscript,
+                        current: trimmed)
                 }
 
-                let attributed = Self.makeAttributed(
+                let attributed = VoiceOverlayTextFormatting.makeAttributed(
                     committed: self.committedTranscript,
                     volatile: self.volatileTranscript,
                     isFinal: update.isFinal)
@@ -337,10 +336,11 @@ actor VoiceWakeRuntime {
         var usedFallback = false
         var match = WakeWordGate.match(transcript: transcript, segments: update.segments, config: gateConfig)
         if match == nil, update.isFinal {
-            match = self.textOnlyFallbackMatch(
+            match = VoiceWakeRecognitionDebugSupport.textOnlyFallbackMatch(
                 transcript: transcript,
                 triggers: config.triggers,
-                config: gateConfig)
+                config: gateConfig,
+                trimWake: Self.trimmedAfterTrigger)
             usedFallback = match != nil
         }
         self.maybeLogRecognition(
@@ -361,7 +361,11 @@ actor VoiceWakeRuntime {
             } else {
                 self.logger.info("voicewake runtime detected len=\(match.command.count)")
             }
-            await self.beginCapture(command: match.command, triggerEndTime: match.triggerEndTime, config: config)
+            await self.beginCapture(
+                command: match.command,
+                triggerEndTime: match.triggerEndTime,
+                triggerWord: match.trigger,
+                config: config)
         } else if !transcript.isEmpty, update.error == nil {
             if self.isTriggerOnly(transcript: transcript, triggers: config.triggers) {
                 self.preDetectTask?.cancel()
@@ -387,22 +391,19 @@ actor VoiceWakeRuntime {
         usedFallback: Bool,
         capturing: Bool)
     {
-        guard !transcript.isEmpty else { return }
-        let level = self.logger.logLevel
-        guard level == .debug || level == .trace else { return }
-        if transcript == self.lastLoggedText, !isFinal {
-            if let last = self.lastLoggedAt, Date().timeIntervalSince(last) < 0.25 {
-                return
-            }
-        }
-        self.lastLoggedText = transcript
-        self.lastLoggedAt = Date()
+        guard VoiceWakeRecognitionDebugSupport.shouldLogTranscript(
+            transcript: transcript,
+            isFinal: isFinal,
+            loggerLevel: self.logger.logLevel,
+            lastLoggedText: &self.lastLoggedText,
+            lastLoggedAt: &self.lastLoggedAt)
+        else { return }
 
-        let textOnly = WakeWordGate.matchesTextOnly(text: transcript, triggers: triggers)
-        let timingCount = segments.count(where: { $0.start > 0 || $0.duration > 0 })
-        let matchSummary = match.map {
-            "match=true gap=\(String(format: "%.2f", $0.postGap))s cmdLen=\($0.command.count)"
-        } ?? "match=false"
+        let summary = VoiceWakeRecognitionDebugSupport.transcriptSummary(
+            transcript: transcript,
+            triggers: triggers,
+            segments: segments)
+        let matchSummary = VoiceWakeRecognitionDebugSupport.matchSummary(match)
         let segmentSummary = segments.map { seg in
             let start = String(format: "%.2f", seg.start)
             let end = String(format: "%.2f", seg.end)
@@ -410,8 +411,8 @@ actor VoiceWakeRuntime {
         }.joined(separator: ", ")
 
         self.logger.debug(
-            "voicewake runtime transcript='\(transcript, privacy: .private)' textOnly=\(textOnly) " +
-                "isFinal=\(isFinal) timing=\(timingCount)/\(segments.count) " +
+            "voicewake runtime transcript='\(transcript, privacy: .private)' textOnly=\(summary.textOnly) " +
+                "isFinal=\(isFinal) timing=\(summary.timingCount)/\(segments.count) " +
                 "capturing=\(capturing) fallback=\(usedFallback) " +
                 "\(matchSummary) segments=[\(segmentSummary, privacy: .private)]")
     }
@@ -492,27 +493,31 @@ actor VoiceWakeRuntime {
             return
         }
         self.logger.info("voicewake runtime detected (trigger-only pause)")
-        await self.beginCapture(command: "", triggerEndTime: nil, config: config)
-    }
-
-    private func textOnlyFallbackMatch(
-        transcript: String,
-        triggers: [String],
-        config: WakeWordGateConfig) -> WakeWordGateMatch?
-    {
-        guard let command = VoiceWakeTextUtils.textOnlyCommand(
-            transcript: transcript,
-            triggers: triggers,
-            minCommandLength: config.minCommandLength,
-            trimWake: Self.trimmedAfterTrigger)
-        else { return nil }
-        return WakeWordGateMatch(triggerEndTime: 0, postGap: 0, command: command)
+        let matchedTrigger = self.matchedTriggerWord(transcript: lastText, triggers: triggers)
+        await self.beginCapture(
+            command: "",
+            triggerEndTime: nil,
+            triggerWord: matchedTrigger,
+            config: config)
     }
 
     private func isTriggerOnly(transcript: String, triggers: [String]) -> Bool {
-        guard WakeWordGate.matchesTextOnly(text: transcript, triggers: triggers) else { return false }
-        guard VoiceWakeTextUtils.startsWithTrigger(transcript: transcript, triggers: triggers) else { return false }
-        return Self.trimmedAfterTrigger(transcript, triggers: triggers).isEmpty
+        Self.isTriggerOnlyText(transcript: transcript, triggers: triggers)
+    }
+
+    private func matchedTriggerWord(transcript: String, triggers: [String]) -> String? {
+        Self.matchedTriggerWordText(transcript: transcript, triggers: triggers)
+    }
+
+    private static func isTriggerOnlyText(transcript: String, triggers: [String]) -> Bool {
+        VoiceWakeTextUtils.isTriggerOnly(
+            transcript: transcript,
+            triggers: triggers,
+            trimWake: self.trimmedAfterTrigger)
+    }
+
+    private static func matchedTriggerWordText(transcript: String, triggers: [String]) -> String? {
+        VoiceWakeTextUtils.matchedTriggerWord(transcript: transcript, triggers: triggers)
     }
 
     private func preDetectSilenceCheck(
@@ -526,10 +531,11 @@ actor VoiceWakeRuntime {
         guard !self.isCapturing else { return }
         guard let lastSeenAt, let lastText else { return }
         guard self.lastTranscriptAt == lastSeenAt, self.lastTranscript == lastText else { return }
-        guard let match = self.textOnlyFallbackMatch(
+        guard let match = VoiceWakeRecognitionDebugSupport.textOnlyFallbackMatch(
             transcript: lastText,
             triggers: triggers,
-            config: gateConfig)
+            config: gateConfig,
+            trimWake: Self.trimmedAfterTrigger)
         else { return }
         if let cooldown = self.cooldownUntil, Date() < cooldown {
             return
@@ -538,11 +544,30 @@ actor VoiceWakeRuntime {
         await self.beginCapture(
             command: match.command,
             triggerEndTime: match.triggerEndTime,
+            triggerWord: match.trigger,
             config: config)
     }
 
-    private func beginCapture(command: String, triggerEndTime: TimeInterval?, config: RuntimeConfig) async {
-        self.listeningState = .voiceWake
+    private func beginCapture(
+        command: String,
+        triggerEndTime: TimeInterval?,
+        triggerWord: String?,
+        config: RuntimeConfig) async
+    {
+        // When "Trigger Talk Mode" is enabled, skip the capture/overlay flow entirely
+        // and activate Talk Mode immediately. Talk Mode handles its own STT pipeline.
+        // Pause the wake listener to avoid two audio pipelines competing on the mic
+        // (mirrors the push-to-talk coordination pattern).
+        if config.triggersTalkMode {
+            self.logger.info("voicewake trigger -> activating Talk Mode (skipping capture)")
+            DiagnosticsFileLog.shared.log(category: "voicewake.runtime", event: "triggerTalkMode")
+            if config.triggerChime != .none {
+                await MainActor.run { VoiceWakeChimePlayer.play(config.triggerChime, reason: "voicewake.trigger") }
+            }
+            self.pauseForPushToTalk()
+            await AppStateStore.shared.setTalkEnabled(true)
+            return
+        }
         self.isCapturing = true
         DiagnosticsFileLog.shared.log(category: "voicewake.runtime", event: "beginCapture")
         self.capturedTranscript = command
@@ -553,6 +578,7 @@ actor VoiceWakeRuntime {
         self.heardBeyondTrigger = !command.isEmpty
         self.triggerChimePlayed = false
         self.activeTriggerEndTime = triggerEndTime
+        self.activeTriggerWord = triggerWord
         self.preDetectTask?.cancel()
         self.preDetectTask = nil
         self.triggerOnlyTask?.cancel()
@@ -564,7 +590,7 @@ actor VoiceWakeRuntime {
         }
 
         let snapshot = self.committedTranscript + self.volatileTranscript
-        let attributed = Self.makeAttributed(
+        let attributed = VoiceOverlayTextFormatting.makeAttributed(
             committed: self.committedTranscript,
             volatile: self.volatileTranscript,
             isFinal: false)
@@ -573,7 +599,8 @@ actor VoiceWakeRuntime {
                 source: .wakeWord,
                 text: snapshot,
                 attributed: attributed,
-                forwardEnabled: true)
+                forwardEnabled: true,
+                voiceWakeTrigger: triggerWord)
         }
 
         // Keep the "ears" boosted for the capture window so the status icon animates while recording.
@@ -628,7 +655,9 @@ actor VoiceWakeRuntime {
         self.lastHeard = nil
         self.heardBeyondTrigger = false
         self.triggerChimePlayed = false
+        let triggerWord = self.activeTriggerWord
         self.activeTriggerEndTime = nil
+        self.activeTriggerWord = nil
         self.lastTranscript = nil
         self.lastTranscriptAt = nil
         self.preDetectTask?.cancel()
@@ -649,14 +678,17 @@ actor VoiceWakeRuntime {
                     token: token,
                     text: finalTranscript,
                     sendChime: sendChime,
-                    autoSendAfter: delay)
+                    autoSendAfter: delay,
+                    voiceWakeTrigger: triggerWord)
             }
         } else if !finalTranscript.isEmpty {
             if sendChime != .none {
                 await MainActor.run { VoiceWakeChimePlayer.play(sendChime, reason: "voicewake.send") }
             }
             Task.detached {
-                await VoiceWakeForwarder.forward(transcript: finalTranscript)
+                await VoiceWakeForwarder.forwardToSelectedSession(
+                    transcript: finalTranscript,
+                    voiceWakeTrigger: triggerWord)
             }
         }
         self.overlayToken = nil
@@ -684,18 +716,6 @@ actor VoiceWakeRuntime {
                 VoiceSessionCoordinator.shared.updateLevel(token: token, clamped)
             }
         }
-    }
-
-    private static func rmsLevel(buffer: AVAudioPCMBuffer) -> Double? {
-        guard let channelData = buffer.floatChannelData?.pointee else { return nil }
-        let frameCount = Int(buffer.frameLength)
-        guard frameCount > 0 else { return nil }
-        var sum: Double = 0
-        for i in 0..<frameCount {
-            let sample = Double(channelData[i])
-            sum += sample * sample
-        }
-        return sqrt(sum / Double(frameCount))
     }
 
     private func restartRecognizer() {
@@ -732,7 +752,6 @@ actor VoiceWakeRuntime {
     }
 
     func pauseForPushToTalk() {
-        self.listeningState = .pushToTalk
         self.stop(dismissOverlay: false)
     }
 
@@ -780,34 +799,13 @@ actor VoiceWakeRuntime {
         !self.trimmedAfterTrigger(text, triggers: triggers).isEmpty
     }
 
-    static func _testAttributedColor(isFinal: Bool) -> NSColor {
-        self.makeAttributed(committed: "sample", volatile: "", isFinal: isFinal)
-            .attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor ?? .clear
+    static func _testIsTriggerOnly(_ text: String, triggers: [String]) -> Bool {
+        self.isTriggerOnlyText(transcript: text, triggers: triggers)
+    }
+
+    static func _testMatchedTriggerWord(_ text: String, triggers: [String]) -> String? {
+        self.matchedTriggerWordText(transcript: text, triggers: triggers)
     }
 
     #endif
-
-    private static func delta(after committed: String, current: String) -> String {
-        if current.hasPrefix(committed) {
-            let start = current.index(current.startIndex, offsetBy: committed.count)
-            return String(current[start...])
-        }
-        return current
-    }
-
-    private static func makeAttributed(committed: String, volatile: String, isFinal: Bool) -> NSAttributedString {
-        let full = NSMutableAttributedString()
-        let committedAttr: [NSAttributedString.Key: Any] = [
-            .foregroundColor: NSColor.labelColor,
-            .font: NSFont.systemFont(ofSize: 13, weight: .regular),
-        ]
-        full.append(NSAttributedString(string: committed, attributes: committedAttr))
-        let volatileColor: NSColor = isFinal ? .labelColor : NSColor.tertiaryLabelColor
-        let volatileAttr: [NSAttributedString.Key: Any] = [
-            .foregroundColor: volatileColor,
-            .font: NSFont.systemFont(ofSize: 13, weight: .regular),
-        ]
-        full.append(NSAttributedString(string: volatile, attributes: volatileAttr))
-        return full
-    }
 }

@@ -1,10 +1,12 @@
 plugins {
-  id("com.android.test")
+  alias(libs.plugins.android.test)
+  alias(libs.plugins.ktlint)
 }
 
 android {
-  namespace = "ai.openclaw.android.benchmark"
-  compileSdk = 36
+  namespace = "ai.openclaw.app.benchmark"
+  // Match the target app while targetSdk remains an independent behavior opt-in.
+  compileSdk = 37
 
   defaultConfig {
     minSdk = 31
@@ -29,8 +31,16 @@ kotlin {
   }
 }
 
+ktlint {
+  android.set(true)
+  ignoreFailures.set(false)
+  filter {
+    exclude("**/build/**")
+  }
+}
+
 dependencies {
-  implementation("androidx.benchmark:benchmark-macro-junit4:1.4.1")
-  implementation("androidx.test.ext:junit:1.2.1")
-  implementation("androidx.test.uiautomator:uiautomator:2.4.0-alpha06")
+  implementation(libs.androidx.benchmark.macro.junit4)
+  implementation(libs.androidx.test.ext.junit)
+  implementation(libs.androidx.uiautomator)
 }

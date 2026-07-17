@@ -1,3 +1,4 @@
+// Interactive transcript export template used by auto-reply HTML reports.
 (function () {
   "use strict";
 
@@ -12,7 +13,16 @@
     bytes[i] = binary.charCodeAt(i);
   }
   const data = JSON.parse(new TextDecoder("utf-8").decode(bytes));
-  const { header, entries, leafId: defaultLeafId, systemPrompt, tools, renderedTools } = data;
+  const {
+    header,
+    entries,
+    leafId: defaultLeafId,
+    hasLeafControl = false,
+    systemPrompt,
+    tools,
+    renderedTools,
+    warning,
+  } = data;
 
   // ============================================================
   // URL PARAMETER HANDLING
@@ -20,7 +30,7 @@
 
   // Parse URL parameters for deep linking: leafId and targetId
   // Check for injected params (when loaded in iframe via srcdoc) or use window.location
-  const injectedParams = document.querySelector('meta[name="pi-url-params"]');
+  const injectedParams = document.querySelector('meta[name="openclaw-url-params"]');
   const searchString = injectedParams
     ? injectedParams.content
     : window.location.search.substring(1);
@@ -350,6 +360,16 @@
     return "";
   }
 
+  function renderableContentBlocks(content) {
+    if (Array.isArray(content)) {
+      return content;
+    }
+    if (typeof content === "string") {
+      return [{ type: "text", text: content }];
+    }
+    return [];
+  }
+
   function getSearchableText(entry, label) {
     const parts = [];
     if (label) {
@@ -665,6 +685,10 @@
     return div.innerHTML;
   }
 
+  function escapeHtmlAttr(text) {
+    return escapeHtml(text).replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+  }
+
   // Validate image fields before interpolating data URLs.
   const SAFE_IMAGE_MIME_RE = /^image\/(png|jpeg|gif|webp|svg\+xml|bmp|tiff|avif)$/i;
   const SAFE_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
@@ -676,11 +700,11 @@
     return "application/octet-stream";
   }
 
-  function sanitizeImageBase64(data) {
-    if (typeof data !== "string") {
+  function sanitizeImageBase64(base64Data) {
+    if (typeof base64Data !== "string") {
       return "";
     }
-    const cleaned = data.replace(/\s+/g, "");
+    const cleaned = base64Data.replace(/\s+/g, "");
     if (!cleaned || cleaned.length % 4 !== 0 || !SAFE_BASE64_RE.test(cleaned)) {
       return "";
     }
@@ -689,11 +713,11 @@
 
   function renderDataUrlImage(img, className) {
     const mimeType = sanitizeImageMimeType(img?.mimeType);
-    const base64 = sanitizeImageBase64(img?.data);
-    if (!base64) {
+    const imgBase64 = sanitizeImageBase64(img?.data);
+    if (!imgBase64) {
       return "";
     }
-    return `<img src="data:${mimeType};base64,${base64}" class="${className}" />`;
+    return `<img src="data:${mimeType};base64,${imgBase64}" class="${className}" />`;
   }
   /**
    * Truncate string to maxLen chars, append "..." if truncated.
@@ -702,7 +726,19 @@
     if (s.length <= maxLen) {
       return s;
     }
-    return s.slice(0, maxLen) + "...";
+    let endOffset = maxLen;
+    const beforeBoundary = s.charCodeAt(endOffset - 1);
+    const afterBoundary = s.charCodeAt(endOffset);
+    // Keep the existing UTF-16 unit ceiling, but retreat if it splits a surrogate pair.
+    if (
+      beforeBoundary >= 0xd800 &&
+      beforeBoundary <= 0xdbff &&
+      afterBoundary >= 0xdc00 &&
+      afterBoundary <= 0xdfff
+    ) {
+      endOffset -= 1;
+    }
+    return s.slice(0, endOffset) + "...";
   }
 
   /**
@@ -841,8 +877,8 @@
         div.appendChild(content);
         // Navigate to the newest leaf through this node, but scroll to the clicked node
         div.addEventListener("click", () => {
-          const leafId = findNewestLeaf(entry.id);
-          navigateTo(leafId, "target", entry.id);
+          const targetLeafId = findNewestLeaf(entry.id);
+          navigateTo(targetLeafId, "target", entry.id);
         });
 
         container.appendChild(div);
@@ -874,7 +910,7 @@
     setTimeout(() => {
       const activeNode = container.querySelector(".tree-node.active");
       if (activeNode) {
-        activeNode.scrollIntoView({ block: "nearest" });
+        activeNode.scrollIntoView?.({ block: "nearest" });
       }
     }, 0);
   }
@@ -1040,7 +1076,7 @@
       if (!result) {
         return "";
       }
-      const textBlocks = result.content.filter((c) => c.type === "text");
+      const textBlocks = renderableContentBlocks(result.content).filter((c) => c.type === "text");
       return textBlocks.map((c) => c.text).join("\n");
     };
 
@@ -1048,7 +1084,7 @@
       if (!result) {
         return [];
       }
-      return result.content.filter((c) => c.type === "image");
+      return renderableContentBlocks(result.content).filter((c) => c.type === "image");
     };
 
     const renderResultImages = () => {
@@ -1237,7 +1273,7 @@
    */
   function buildShareUrl(entryId) {
     // Check for injected base URL (used when loaded in iframe via srcdoc)
-    const baseUrlMeta = document.querySelector('meta[name="pi-share-base-url"]');
+    const baseUrlMeta = document.querySelector('meta[name="openclaw-share-base-url"]');
     const baseUrl = baseUrlMeta ? baseUrlMeta.content : window.location.href.split("?")[0];
 
     const url = new URL(window.location.href);
@@ -1305,7 +1341,7 @@
    * Render the copy-link button HTML for a message.
    */
   function renderCopyLinkButton(entryId) {
-    return `<button class="copy-link-btn" data-entry-id="${entryId}" title="Copy link to this message">
+    return `<button class="copy-link-btn" data-entry-id="${escapeHtmlAttr(entryId)}" title="Copy link to this message">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
             <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
@@ -1316,7 +1352,7 @@
   function renderEntry(entry) {
     const ts = formatTimestamp(entry.timestamp);
     const tsHtml = ts ? `<div class="message-timestamp">${ts}</div>` : "";
-    const entryId = `entry-${entry.id}`;
+    const entryId = `entry-${escapeHtmlAttr(entry.id)}`;
     const copyBtnHtml = renderCopyLinkButton(entry.id);
 
     if (entry.type === "message") {
@@ -1340,10 +1376,12 @@
         const text =
           typeof content === "string"
             ? content
-            : content
-                .filter((c) => c.type === "text")
-                .map((c) => c.text)
-                .join("\n");
+            : Array.isArray(content)
+                ? content
+                    .filter((c) => c.type === "text")
+                    .map((c) => c.text)
+                    .join("\n")
+                : "";
         if (text.trim()) {
           html += `<div class="markdown-content">${safeMarkedParse(text)}</div>`;
         }
@@ -1353,8 +1391,9 @@
 
       if (msg.role === "assistant") {
         let html = `<div class="assistant-message" id="${entryId}">${copyBtnHtml}${tsHtml}`;
+        const contentBlocks = renderableContentBlocks(msg.content);
 
-        for (const block of msg.content) {
+        for (const block of contentBlocks) {
           if (block.type === "text" && block.text.trim()) {
             html += `<div class="assistant-text markdown-content">${safeMarkedParse(block.text)}</div>`;
           } else if (block.type === "thinking" && block.thinking.trim()) {
@@ -1365,7 +1404,7 @@
           }
         }
 
-        for (const block of msg.content) {
+        for (const block of contentBlocks) {
           if (block.type === "toolCall") {
             html += renderToolCall(block);
           }
@@ -1470,7 +1509,7 @@
               cost.cacheWrite += msg.usage.cost.cacheWrite || 0;
             }
           }
-          toolCalls += msg.content.filter((c) => c.type === "toolCall").length;
+          toolCalls += (Array.isArray(msg.content) ? msg.content : []).filter((c) => c.type === "toolCall").length;
         }
         if (msg.role === "toolResult") {
           toolResults++;
@@ -1541,7 +1580,11 @@
       msgParts.push(`${globalStats.branchSummaries} branch summaries`);
     }
 
-    let html = `
+    let html = "";
+    if (warning) {
+      html += `<div class="export-warning">${escapeHtml(warning)}</div>`;
+    }
+    html += `
           <div class="header">
             <h1>Session: ${escapeHtml(header?.id || "unknown")}</h1>
             <div class="help-bar">
@@ -1692,7 +1735,7 @@
         const scrollTargetId = scrollToEntryId || targetId;
         const targetEl = document.getElementById(`entry-${scrollTargetId}`);
         if (targetEl) {
-          targetEl.scrollIntoView({ block: "center" });
+          targetEl.scrollIntoView?.({ block: "center" });
           // Briefly highlight the target message
           if (scrollToEntryId) {
             targetEl.classList.add("highlight");
@@ -1710,6 +1753,89 @@
   // Escape HTML tags in text (but not code blocks)
   function escapeHtmlTags(text) {
     return text.replace(/<(?=[a-zA-Z/])/g, "&lt;");
+  }
+
+  const INLINE_DATA_IMAGE_RE = /^data:image\/[a-z0-9.+-]+;base64,/i;
+
+  function normalizeMarkdownImageLabel(text) {
+    const trimmed = typeof text === "string" ? text.trim() : "";
+    return trimmed || "image";
+  }
+
+  function renderMarkdownImage(token) {
+    const label = normalizeMarkdownImageLabel(token?.text);
+    const href = typeof token?.href === "string" ? token.href.trim() : "";
+    if (!INLINE_DATA_IMAGE_RE.test(href)) {
+      return escapeHtml(label);
+    }
+    return `<img src="${escapeHtmlAttr(href)}" alt="${escapeHtmlAttr(label)}">`;
+  }
+
+  const SAFE_MARKDOWN_LINK_PROTOCOLS = new Set(["http:", "https:", "mailto:", "tel:", "ftp:"]);
+
+  function decodeMarkdownHrefCodePoint(value, radix) {
+    const codePoint = Number.parseInt(value, radix);
+    if (
+      !Number.isFinite(codePoint) ||
+      codePoint < 0 ||
+      codePoint > 0x10ffff ||
+      (codePoint >= 0xd800 && codePoint <= 0xdfff)
+    ) {
+      return "";
+    }
+    return String.fromCodePoint(codePoint);
+  }
+
+  function decodeMarkdownHrefEntities(text) {
+    return text.replace(
+      /&(?:#(\d+)|#x([\da-f]+)|(colon|tab|newline));/gi,
+      (_match, decimal, hex, named) => {
+        if (decimal) {
+          return decodeMarkdownHrefCodePoint(decimal, 10);
+        }
+        if (hex) {
+          return decodeMarkdownHrefCodePoint(hex, 16);
+        }
+        if (named?.toLowerCase() === "tab") {
+          return "\t";
+        }
+        if (named?.toLowerCase() === "newline") {
+          return "\n";
+        }
+        return ":";
+      },
+    );
+  }
+
+  function getMarkdownHrefProtocol(href) {
+    const normalized = decodeMarkdownHrefEntities(href)
+      .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u2028\u2029\ufeff\s]+/g, "")
+      .trim();
+    const match = /^([a-z][a-z0-9+.-]*):/i.exec(normalized);
+    return match ? `${match[1].toLowerCase()}:` : null;
+  }
+
+  function isSafeMarkdownLinkHref(href) {
+    const trimmed = typeof href === "string" ? href.trim() : "";
+    if (!trimmed) {
+      return true;
+    }
+    const protocol = getMarkdownHrefProtocol(trimmed);
+    return protocol === null || SAFE_MARKDOWN_LINK_PROTOCOLS.has(protocol);
+  }
+
+  function renderMarkdownLink(token) {
+    const text = this.parser.parseInline(token.tokens);
+    const href = typeof token?.href === "string" ? token.href.trim() : "";
+    if (!isSafeMarkdownLinkHref(href)) {
+      return text;
+    }
+
+    let html = `<a href="${escapeHtmlAttr(href)}"`;
+    if (typeof token?.title === "string" && token.title) {
+      html += ` title="${escapeHtmlAttr(token.title)}"`;
+    }
+    return `${html}>${text}</a>`;
   }
 
   // Configure marked with syntax highlighting and HTML escaping for text
@@ -1749,6 +1875,12 @@
       // Raw HTML blocks/inline HTML: escape to prevent script execution.
       html(token) {
         return escapeHtml(token.text);
+      },
+      image(token) {
+        return renderMarkdownImage(token);
+      },
+      link(token) {
+        return renderMarkdownLink.call(this, token);
       },
     },
   });
@@ -1845,6 +1977,9 @@
     } else {
       navigateTo(leafId, "none");
     }
+  } else if (hasLeafControl) {
+    // A null leaf selected by a control record is an intentional empty branch.
+    navigateTo(null, "none");
   } else if (entries.length > 0) {
     // Fallback: use last entry if no leafId
     navigateTo(entries[entries.length - 1].id, "none");

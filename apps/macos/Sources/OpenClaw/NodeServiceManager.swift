@@ -3,10 +3,14 @@ import OSLog
 
 enum NodeServiceManager {
     private static let logger = Logger(subsystem: "ai.openclaw", category: "node.service")
+    private static var launchdPlistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(nodeLaunchdLabel).plist")
+    }
 
     static func start() async -> String? {
         let result = await self.runServiceCommandResult(
-            ["node", "start"],
+            ["start"],
             timeout: 20,
             quiet: false)
         if let error = self.errorMessage(from: result, treatNotLoadedAsError: true) {
@@ -18,7 +22,7 @@ enum NodeServiceManager {
 
     static func stop() async -> String? {
         let result = await self.runServiceCommandResult(
-            ["node", "stop"],
+            ["stop"],
             timeout: 15,
             quiet: false)
         if let error = self.errorMessage(from: result, treatNotLoadedAsError: false) {
@@ -27,9 +31,60 @@ enum NodeServiceManager {
         }
         return nil
     }
+
+    static func restart() async -> String? {
+        let result = await self.runServiceCommandResult(
+            ["restart"],
+            timeout: 20,
+            quiet: false)
+        if let error = self.errorMessage(from: result, treatNotLoadedAsError: true) {
+            self.logger.error("node service restart failed: \(error, privacy: .public)")
+            return error
+        }
+        return nil
+    }
+
+    /// Empty means no node LaunchAgent. Nil means the on-disk ownership proof
+    /// exists but could not be read, so callers must not treat it as external.
+    static func launchdProgramArguments() -> [String]? {
+        self.launchdProgramArguments(
+            plistURL: self.launchdPlistURL,
+            fileManager: .default)
+    }
+
+    static func waitUntilRunning() async -> Bool {
+        var consecutiveRunningChecks = 0
+        for attempt in 0..<20 {
+            let result = await self.runServiceCommandResult(
+                ["status"],
+                timeout: 10,
+                quiet: true)
+            if result.success,
+               let object = result.parsed?.object,
+               self.runtimeIsRunning(in: object)
+            {
+                consecutiveRunningChecks += 1
+                if consecutiveRunningChecks == 2 { return true }
+            } else {
+                consecutiveRunningChecks = 0
+            }
+            if attempt < 19 {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+        return false
+    }
 }
 
 extension NodeServiceManager {
+    private static func serviceCommand(_ args: [String]) -> [String] {
+        CommandResolver.openclawCommand(
+            subcommand: "node",
+            extraArgs: self.withJsonFlag(args),
+            // Service management must always run locally, even if remote mode is configured.
+            configRoot: ["gateway": ["mode": "local"]])
+    }
+
     private struct CommandResult {
         let success: Bool
         let payload: Data?
@@ -52,11 +107,7 @@ extension NodeServiceManager {
         timeout: Double,
         quiet: Bool) async -> CommandResult
     {
-        let command = CommandResolver.openclawCommand(
-            subcommand: "service",
-            extraArgs: self.withJsonFlag(args),
-            // Service management must always run locally, even if remote mode is configured.
-            configRoot: ["gateway": ["mode": "local"]])
+        let command = self.serviceCommand(args)
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = CommandResolver.preferredPaths().joined(separator: ":")
         let response = await ShellExecutor.runDetailed(command: command, cwd: nil, env: env, timeout: timeout)
@@ -103,15 +154,9 @@ extension NodeServiceManager {
     }
 
     private static func parseServiceJson(from raw: String) -> ParsedServiceJson? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let start = trimmed.firstIndex(of: "{"),
-              let end = trimmed.lastIndex(of: "}")
-        else {
-            return nil
-        }
-        let jsonText = String(trimmed[start...end])
-        guard let data = jsonText.data(using: .utf8) else { return nil }
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        guard let parsed = JSONObjectExtractionSupport.extract(from: raw) else { return nil }
+        let jsonText = parsed.text
+        let object = parsed.object
         let ok = object["ok"] as? Bool
         let result = object["result"] as? String
         let message = object["message"] as? String
@@ -138,13 +183,40 @@ extension NodeServiceManager {
         return hintText
     }
 
+    private static func launchdProgramArguments(
+        plistURL: URL,
+        fileManager: FileManager) -> [String]?
+    {
+        guard fileManager.fileExists(atPath: plistURL.path) else { return [] }
+        return LaunchAgentPlist.snapshot(url: plistURL)?.programArguments
+    }
+
+    private static func runtimeIsRunning(in object: [String: Any]) -> Bool {
+        guard let service = object["service"] as? [String: Any],
+              service["loaded"] as? Bool == true,
+              let runtime = service["runtime"] as? [String: Any]
+        else { return false }
+        return runtime["status"] as? String == "running"
+    }
+
     private static func summarize(_ text: String) -> String? {
-        let lines = text
-            .split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard let last = lines.last else { return nil }
-        let normalized = last.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-        return normalized.count > 200 ? String(normalized.prefix(199)) + "…" : normalized
+        TextSummarySupport.summarizeLastLine(text)
     }
 }
+
+#if DEBUG
+extension NodeServiceManager {
+    static func _testServiceCommand(_ args: [String]) -> [String] {
+        self.serviceCommand(args)
+    }
+
+    static func _testLaunchdProgramArguments(plistURL: URL) -> [String]? {
+        self.launchdProgramArguments(plistURL: plistURL, fileManager: .default)
+    }
+
+    static func _testRuntimeIsRunning(fromJSON json: String) -> Bool {
+        guard let object = JSONObjectExtractionSupport.extract(from: json)?.object else { return false }
+        return self.runtimeIsRunning(in: object)
+    }
+}
+#endif

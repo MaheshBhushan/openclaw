@@ -6,262 +6,263 @@ read_when:
 title: "Venice AI"
 ---
 
-# Venice AI (Venice highlight)
+[Venice AI](https://venice.ai) provides privacy-focused inference: open models run
+with no logging, plus anonymized proxy access to Claude, GPT, Gemini, and Grok.
+All endpoints are OpenAI-compatible (`/v1`).
 
-**Venice** is our highlight Venice setup for privacy-first inference with optional anonymized access to proprietary models.
+## Privacy modes
 
-Venice AI provides privacy-focused AI inference with support for uncensored models and access to major proprietary models through their anonymized proxy. All inference is private by default—no training on your data, no logging.
+| Mode           | Behavior                                                         | Models                                                        |
+| -------------- | ---------------------------------------------------------------- | ------------------------------------------------------------- |
+| **Private**    | Prompts/responses are never stored or logged. Ephemeral.         | Llama, Qwen, DeepSeek, Kimi, MiniMax, Venice Uncensored, etc. |
+| **Anonymized** | Proxied through Venice with metadata stripped before forwarding. | Claude, GPT, Gemini, Grok                                     |
 
-## Why Venice in OpenClaw
+<Warning>
+Anonymized models are not fully private. Venice strips metadata before forwarding, but the underlying provider (OpenAI, Anthropic, Google, xAI) still processes the request. Use Private models when full privacy is required.
+</Warning>
 
-- **Private inference** for open-source models (no logging).
-- **Uncensored models** when you need them.
-- **Anonymized access** to proprietary models (Opus/GPT/Gemini) when quality matters.
-- OpenAI-compatible `/v1` endpoints.
+## Getting started
 
-## Privacy Modes
+<Steps>
+  <Step title="Install the plugin">
+    ```bash
+    openclaw plugins install @openclaw/venice-provider
+    ```
+  </Step>
+  <Step title="Get your API key">
+    1. Sign up at [venice.ai](https://venice.ai)
+    2. Go to **Settings > API Keys > Create new key**
+    3. Copy your API key (format: `vapi_xxxxxxxxxxxx`)
+  </Step>
+  <Step title="Configure OpenClaw">
+    <Tabs>
+      <Tab title="Interactive (recommended)">
+        ```bash
+        openclaw onboard --auth-choice venice-api-key
+        ```
 
-Venice offers two privacy levels — understanding this is key to choosing your model:
+        Prompts for the API key (or reuses an existing `VENICE_API_KEY`), lists available Venice models, and sets your default model.
+      </Tab>
+      <Tab title="Environment variable">
+        ```bash
+        export VENICE_API_KEY="vapi_xxxxxxxxxxxx"
+        ```
+      </Tab>
+      <Tab title="Non-interactive">
+        ```bash
+        openclaw onboard --non-interactive \
+          --auth-choice venice-api-key \
+          --venice-api-key "vapi_xxxxxxxxxxxx"
+        ```
+      </Tab>
+    </Tabs>
 
-| Mode           | Description                                                                                                          | Models                                         |
-| -------------- | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| **Private**    | Fully private. Prompts/responses are **never stored or logged**. Ephemeral.                                          | Llama, Qwen, DeepSeek, Venice Uncensored, etc. |
-| **Anonymized** | Proxied through Venice with metadata stripped. The underlying provider (OpenAI, Anthropic) sees anonymized requests. | Claude, GPT, Gemini, Grok, Kimi, MiniMax       |
+  </Step>
+  <Step title="Verify setup">
+    ```bash
+    openclaw agent --model venice/kimi-k2-5 --message "Hello, are you working?"
+    ```
+  </Step>
+</Steps>
 
-## Features
+## Model selection
 
-- **Privacy-focused**: Choose between "private" (fully private) and "anonymized" (proxied) modes
-- **Uncensored models**: Access to models without content restrictions
-- **Major model access**: Use Claude, GPT-5.2, Gemini, Grok via Venice's anonymized proxy
-- **OpenAI-compatible API**: Standard `/v1` endpoints for easy integration
-- **Streaming**: ✅ Supported on all models
-- **Function calling**: ✅ Supported on select models (check model capabilities)
-- **Vision**: ✅ Supported on models with vision capability
-- **No hard rate limits**: Fair-use throttling may apply for extreme usage
-
-## Setup
-
-### 1. Get API Key
-
-1. Sign up at [venice.ai](https://venice.ai)
-2. Go to **Settings → API Keys → Create new key**
-3. Copy your API key (format: `vapi_xxxxxxxxxxxx`)
-
-### 2. Configure OpenClaw
-
-**Option A: Environment Variable**
-
-```bash
-export VENICE_API_KEY="vapi_xxxxxxxxxxxx"
-```
-
-**Option B: Interactive Setup (Recommended)**
-
-```bash
-openclaw onboard --auth-choice venice-api-key
-```
-
-This will:
-
-1. Prompt for your API key (or use existing `VENICE_API_KEY`)
-2. Show all available Venice models
-3. Let you pick your default model
-4. Configure the provider automatically
-
-**Option C: Non-interactive**
-
-```bash
-openclaw onboard --non-interactive \
-  --auth-choice venice-api-key \
-  --venice-api-key "vapi_xxxxxxxxxxxx"
-```
-
-### 3. Verify Setup
+- **Default**: `venice/kimi-k2-5` (private, reasoning, vision).
+- **Strongest anonymized option**: `venice/claude-opus-4-6`.
 
 ```bash
-openclaw agent --model venice/llama-3.3-70b --message "Hello, are you working?"
+openclaw models set venice/kimi-k2-5
+openclaw models list --all --provider venice
 ```
 
-## Model Selection
+You can also run `openclaw configure` and pick **Model/auth provider > Venice AI**.
 
-After setup, OpenClaw shows all available Venice models. Pick based on your needs:
+<Tip>
+| Use case              | Model                                        | Why                                    |
+| --------------------- | -------------------------------------------- | -------------------------------------- |
+| General chat (default) | `kimi-k2-5`                                  | Strong private reasoning plus vision   |
+| Best overall quality   | `claude-opus-4-6`                            | Strongest anonymized Venice option     |
+| Privacy + coding       | `qwen3-coder-480b-a35b-instruct-turbo`       | Private coding model with large context |
+| Fast + cheap           | `llama-3.2-3b`                               | Compact private model                  |
+| Complex private tasks  | `deepseek-v3.2`                              | Strong reasoning; tool calling disabled |
+| Uncensored             | `venice-uncensored-1-2`                      | Current uncensored Venice model        |
+</Tip>
 
-- **Default (our pick)**: `venice/llama-3.3-70b` for private, balanced performance.
-- **Best overall quality**: `venice/claude-opus-45` for hard jobs (Opus remains the strongest).
-- **Privacy**: Choose "private" models for fully private inference.
-- **Capability**: Choose "anonymized" models to access Claude, GPT, Gemini via Venice's proxy.
+## Built-in catalog (30 models)
 
-Change your default model anytime:
+<AccordionGroup>
+  <Accordion title="Private models (20) — fully private, no logging">
+    | Model ID                               | Name                                 | Context | Notes                      |
+    | -------------------------------------- | ------------------------------------- | ------- | --------------------------- |
+    | `kimi-k2-5`                            | Kimi K2.5                             | 256k    | Default, reasoning, vision  |
+    | `llama-3.3-70b`                        | Llama 3.3 70B                         | 128k    | General                     |
+    | `llama-3.2-3b`                         | Llama 3.2 3B                          | 128k    | General                     |
+    | `hermes-3-llama-3.1-405b`              | Hermes 3 Llama 3.1 405B               | 128k    | General, tools disabled     |
+    | `qwen3-235b-a22b-thinking-2507`        | Qwen3 235B Thinking                   | 128k    | Reasoning                   |
+    | `qwen3-235b-a22b-instruct-2507`        | Qwen3 235B Instruct                   | 128k    | General                     |
+    | `qwen3-coder-480b-a35b-instruct-turbo` | Qwen3 Coder 480B Turbo                | 256k    | Coding                      |
+    | `qwen3-5-35b-a3b`                      | Qwen3.5 35B A3B                       | 256k    | Reasoning, vision           |
+    | `qwen3-next-80b`                       | Qwen3 Next 80B                        | 256k    | General                     |
+    | `qwen3-vl-235b-a22b`                   | Qwen3 VL 235B (Vision)                | 256k    | Vision                      |
+    | `deepseek-v3.2`                        | DeepSeek V3.2                         | 160k    | Reasoning, tools disabled    |
+    | `google-gemma-3-27b-it`                | Google Gemma 3 27B Instruct           | 198k    | Vision                       |
+    | `openai-gpt-oss-120b`                  | OpenAI GPT OSS 120B                   | 128k    | General                      |
+    | `nvidia-nemotron-3-nano-30b-a3b`       | NVIDIA Nemotron 3 Nano 30B            | 128k    | General                      |
+    | `olafangensan-glm-4.7-flash-heretic`   | GLM 4.7 Flash Heretic                 | 128k    | Reasoning                    |
+    | `zai-org-glm-4.6`                      | GLM 4.6                               | 198k    | General                      |
+    | `zai-org-glm-4.7`                      | GLM 4.7                               | 198k    | Reasoning                    |
+    | `zai-org-glm-4.7-flash`                | GLM 4.7 Flash                         | 128k    | Reasoning                    |
+    | `zai-org-glm-5`                        | GLM 5                                 | 198k    | Reasoning                    |
+    | `minimax-m25`                          | MiniMax M2.5                          | 198k    | Reasoning                    |
+  </Accordion>
 
-```bash
-openclaw models set venice/claude-opus-45
-openclaw models set venice/llama-3.3-70b
-```
+  <Accordion title="Anonymized models (10) — via Venice proxy">
+    | Model ID                        | Name                           | Context | Notes                      |
+    | -------------------------------- | -------------------------------- | ------- | ---------------------------- |
+    | `claude-opus-4-6`               | Claude Opus 4.6 (via Venice)    | 1M      | Reasoning, vision            |
+    | `claude-sonnet-4-6`             | Claude Sonnet 4.6 (via Venice)  | 1M      | Reasoning, vision            |
+    | `openai-gpt-54`                 | GPT-5.4 (via Venice)            | 1M      | Reasoning, vision            |
+    | `openai-gpt-53-codex`           | GPT-5.3 Codex (via Venice)      | 400k    | Reasoning, vision, coding     |
+    | `openai-gpt-52`                 | GPT-5.2 (via Venice)            | 256k    | Reasoning                    |
+    | `openai-gpt-52-codex`           | GPT-5.2 Codex (via Venice)      | 256k    | Reasoning, vision, coding     |
+    | `openai-gpt-4o-2024-11-20`      | GPT-4o (via Venice)             | 128k    | Vision                        |
+    | `openai-gpt-4o-mini-2024-07-18` | GPT-4o Mini (via Venice)        | 128k    | Vision                        |
+    | `gemini-3-1-pro-preview`        | Gemini 3.1 Pro (via Venice)     | 1M      | Reasoning, vision             |
+    | `gemini-3-flash-preview`        | Gemini 3 Flash (via Venice)     | 256k    | Reasoning, vision             |
+  </Accordion>
+</AccordionGroup>
 
-List all available models:
+Grok-backed Venice models (`grok-4-3` and similar) get the same tool-schema
+compat patch as the native xAI provider, since they share the same upstream
+tool-call format.
 
-```bash
-openclaw models list | grep venice
-```
+## Model discovery
 
-## Configure via `openclaw configure`
+The bundled catalog above is a manifest-backed seed list. At runtime OpenClaw
+refreshes it from the Venice `/models` API and falls back to the seed list if
+the API is unreachable. The `/models` endpoint is public (no auth needed for
+listing), but inference requires a valid API key.
 
-1. Run `openclaw configure`
-2. Select **Model/auth**
-3. Choose **Venice AI**
+Venice may continue accepting retired model IDs as provider-owned aliases. The
+OpenClaw catalog advertises only the canonical model IDs returned by `/models`.
 
-## Which Model Should I Use?
+## DeepSeek V4 replay behavior
 
-| Use Case                     | Recommended Model                | Why                                       |
-| ---------------------------- | -------------------------------- | ----------------------------------------- |
-| **General chat**             | `llama-3.3-70b`                  | Good all-around, fully private            |
-| **Best overall quality**     | `claude-opus-45`                 | Opus remains the strongest for hard tasks |
-| **Privacy + Claude quality** | `claude-opus-45`                 | Best reasoning via anonymized proxy       |
-| **Coding**                   | `qwen3-coder-480b-a35b-instruct` | Code-optimized, 262k context              |
-| **Vision tasks**             | `qwen3-vl-235b-a22b`             | Best private vision model                 |
-| **Uncensored**               | `venice-uncensored`              | No content restrictions                   |
-| **Fast + cheap**             | `qwen3-4b`                       | Lightweight, still capable                |
-| **Complex reasoning**        | `deepseek-v3.2`                  | Strong reasoning, private                 |
+If Venice exposes DeepSeek V4 models such as `deepseek-v4-pro` or
+`deepseek-v4-flash`, OpenClaw fills the required `reasoning_content` replay
+field on assistant messages when Venice omits it, and strips `thinking`/
+`reasoning`/`reasoning_effort` from the request payload (Venice rejects
+DeepSeek's native `thinking` control on these models). This replay fix is
+separate from the native DeepSeek provider's own thinking controls.
 
-## Available Models (25 Total)
+## Streaming and tool support
 
-### Private Models (15) — Fully Private, No Logging
-
-| Model ID                         | Name                    | Context (tokens) | Features                |
-| -------------------------------- | ----------------------- | ---------------- | ----------------------- |
-| `llama-3.3-70b`                  | Llama 3.3 70B           | 131k             | General                 |
-| `llama-3.2-3b`                   | Llama 3.2 3B            | 131k             | Fast, lightweight       |
-| `hermes-3-llama-3.1-405b`        | Hermes 3 Llama 3.1 405B | 131k             | Complex tasks           |
-| `qwen3-235b-a22b-thinking-2507`  | Qwen3 235B Thinking     | 131k             | Reasoning               |
-| `qwen3-235b-a22b-instruct-2507`  | Qwen3 235B Instruct     | 131k             | General                 |
-| `qwen3-coder-480b-a35b-instruct` | Qwen3 Coder 480B        | 262k             | Code                    |
-| `qwen3-next-80b`                 | Qwen3 Next 80B          | 262k             | General                 |
-| `qwen3-vl-235b-a22b`             | Qwen3 VL 235B           | 262k             | Vision                  |
-| `qwen3-4b`                       | Venice Small (Qwen3 4B) | 32k              | Fast, reasoning         |
-| `deepseek-v3.2`                  | DeepSeek V3.2           | 163k             | Reasoning               |
-| `venice-uncensored`              | Venice Uncensored       | 32k              | Uncensored              |
-| `mistral-31-24b`                 | Venice Medium (Mistral) | 131k             | Vision                  |
-| `google-gemma-3-27b-it`          | Gemma 3 27B Instruct    | 202k             | Vision                  |
-| `openai-gpt-oss-120b`            | OpenAI GPT OSS 120B     | 131k             | General                 |
-| `zai-org-glm-4.7`                | GLM 4.7                 | 202k             | Reasoning, multilingual |
-
-### Anonymized Models (10) — Via Venice Proxy
-
-| Model ID                 | Original          | Context (tokens) | Features          |
-| ------------------------ | ----------------- | ---------------- | ----------------- |
-| `claude-opus-45`         | Claude Opus 4.5   | 202k             | Reasoning, vision |
-| `claude-sonnet-45`       | Claude Sonnet 4.5 | 202k             | Reasoning, vision |
-| `openai-gpt-52`          | GPT-5.2           | 262k             | Reasoning         |
-| `openai-gpt-52-codex`    | GPT-5.2 Codex     | 262k             | Reasoning, vision |
-| `gemini-3-pro-preview`   | Gemini 3 Pro      | 202k             | Reasoning, vision |
-| `gemini-3-flash-preview` | Gemini 3 Flash    | 262k             | Reasoning, vision |
-| `grok-41-fast`           | Grok 4.1 Fast     | 262k             | Reasoning, vision |
-| `grok-code-fast-1`       | Grok Code Fast 1  | 262k             | Reasoning, code   |
-| `kimi-k2-thinking`       | Kimi K2 Thinking  | 262k             | Reasoning         |
-| `minimax-m21`            | MiniMax M2.1      | 202k             | Reasoning         |
-
-## Model Discovery
-
-OpenClaw automatically discovers models from the Venice API when `VENICE_API_KEY` is set. If the API is unreachable, it falls back to a static catalog.
-
-The `/models` endpoint is public (no auth needed for listing), but inference requires a valid API key.
-
-## Streaming & Tool Support
-
-| Feature              | Support                                                 |
-| -------------------- | ------------------------------------------------------- |
-| **Streaming**        | ✅ All models                                           |
-| **Function calling** | ✅ Most models (check `supportsFunctionCalling` in API) |
-| **Vision/Images**    | ✅ Models marked with "Vision" feature                  |
-| **JSON mode**        | ✅ Supported via `response_format`                      |
+| Feature          | Support                                           |
+| ---------------- | ------------------------------------------------- |
+| Streaming        | All models                                        |
+| Function calling | Most models; disabled per-model where noted above |
+| Vision/Images    | Models marked "Vision" above                      |
+| JSON mode        | Via `response_format`                             |
 
 ## Pricing
 
-Venice uses a credit-based system. Check [venice.ai/pricing](https://venice.ai/pricing) for current rates:
+Venice uses a credit-based system. Anonymized models cost roughly the same as
+direct API pricing plus a small Venice fee. See
+[venice.ai/pricing](https://venice.ai/pricing) for current rates.
 
-- **Private models**: Generally lower cost
-- **Anonymized models**: Similar to direct API pricing + small Venice fee
-
-## Comparison: Venice vs Direct API
-
-| Aspect       | Venice (Anonymized)           | Direct API          |
-| ------------ | ----------------------------- | ------------------- |
-| **Privacy**  | Metadata stripped, anonymized | Your account linked |
-| **Latency**  | +10-50ms (proxy)              | Direct              |
-| **Features** | Most features supported       | Full features       |
-| **Billing**  | Venice credits                | Provider billing    |
-
-## Usage Examples
+## Usage examples
 
 ```bash
-# Use default private model
-openclaw agent --model venice/llama-3.3-70b --message "Quick health check"
+# Default private model
+openclaw agent --model venice/kimi-k2-5 --message "Quick health check"
 
-# Use Claude via Venice (anonymized)
-openclaw agent --model venice/claude-opus-45 --message "Summarize this task"
+# Claude Opus via Venice (anonymized)
+openclaw agent --model venice/claude-opus-4-6 --message "Summarize this task"
 
-# Use uncensored model
-openclaw agent --model venice/venice-uncensored --message "Draft options"
+# Uncensored model
+openclaw agent --model venice/venice-uncensored-1-2 --message "Draft options"
 
-# Use vision model with image
+# Vision model with image
 openclaw agent --model venice/qwen3-vl-235b-a22b --message "Review attached image"
 
-# Use coding model
-openclaw agent --model venice/qwen3-coder-480b-a35b-instruct --message "Refactor this function"
+# Coding model
+openclaw agent --model venice/qwen3-coder-480b-a35b-instruct-turbo --message "Refactor this function"
 ```
 
 ## Troubleshooting
 
-### API key not recognized
+<AccordionGroup>
+  <Accordion title="API key not recognized">
+    ```bash
+    echo $VENICE_API_KEY
+    openclaw models list | grep venice
+    ```
 
-```bash
-echo $VENICE_API_KEY
-openclaw models list | grep venice
-```
+    Confirm the key starts with `vapi_`.
 
-Ensure the key starts with `vapi_`.
+  </Accordion>
 
-### Model not available
+  <Accordion title="Model not available">
+    Run `openclaw models list --all --provider venice` to see currently
+    available models; the catalog changes as Venice adds or retires models.
+  </Accordion>
 
-The Venice model catalog updates dynamically. Run `openclaw models list` to see currently available models. Some models may be temporarily offline.
+  <Accordion title="Connection issues">
+    Venice API is at `https://api.venice.ai/api/v1`. Confirm your network allows HTTPS to that host.
+  </Accordion>
+</AccordionGroup>
 
-### Connection issues
+<Note>
+More help: [Troubleshooting](/help/troubleshooting) and [FAQ](/help/faq).
+</Note>
 
-Venice API is at `https://api.venice.ai/api/v1`. Ensure your network allows HTTPS connections.
+## Advanced configuration
 
-## Config file example
-
-```json5
-{
-  env: { VENICE_API_KEY: "vapi_..." },
-  agents: { defaults: { model: { primary: "venice/llama-3.3-70b" } } },
-  models: {
-    mode: "merge",
-    providers: {
-      venice: {
-        baseUrl: "https://api.venice.ai/api/v1",
-        apiKey: "${VENICE_API_KEY}",
-        api: "openai-completions",
-        models: [
-          {
-            id: "llama-3.3-70b",
-            name: "Llama 3.3 70B",
-            reasoning: false,
-            input: ["text"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 131072,
-            maxTokens: 8192,
+<AccordionGroup>
+  <Accordion title="Config file example">
+    ```json5
+    {
+      env: { VENICE_API_KEY: "vapi_..." },
+      agents: { defaults: { model: { primary: "venice/kimi-k2-5" } } },
+      models: {
+        mode: "merge",
+        providers: {
+          venice: {
+            baseUrl: "https://api.venice.ai/api/v1",
+            apiKey: "${VENICE_API_KEY}",
+            api: "openai-completions",
+            models: [
+              {
+                id: "kimi-k2-5",
+                name: "Kimi K2.5",
+                reasoning: true,
+                input: ["text", "image"],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 256000,
+                maxTokens: 65536,
+              },
+            ],
           },
-        ],
+        },
       },
-    },
-  },
-}
-```
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
 
-## Links
+## Related
 
-- [Venice AI](https://venice.ai)
-- [API Documentation](https://docs.venice.ai)
-- [Pricing](https://venice.ai/pricing)
-- [Status](https://status.venice.ai)
+<CardGroup cols={2}>
+  <Card title="Model selection" href="/concepts/model-providers" icon="layers">
+    Choosing providers, model refs, and failover behavior.
+  </Card>
+  <Card title="Venice AI" href="https://venice.ai" icon="globe">
+    Venice AI homepage and account signup.
+  </Card>
+  <Card title="API documentation" href="https://docs.venice.ai" icon="book">
+    Venice API reference and developer docs.
+  </Card>
+  <Card title="Pricing" href="https://venice.ai/pricing" icon="credit-card">
+    Current Venice credit rates and plans.
+  </Card>
+</CardGroup>

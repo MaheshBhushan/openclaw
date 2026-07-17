@@ -1,6 +1,5 @@
 import AppKit
 import Foundation
-import OpenClawIPC
 import OpenClawKit
 import WebKit
 
@@ -9,22 +8,68 @@ final class CanvasA2UIActionMessageHandler: NSObject, WKScriptMessageHandler {
     static let allMessageNames = [messageName]
 
     private let sessionKey: String
+    private var expectedRemoteURL: URL?
 
     init(sessionKey: String) {
         self.sessionKey = sessionKey
         super.init()
     }
 
+    func setTrustedRemoteURL(_ url: URL?) {
+        self.expectedRemoteURL = url.flatMap {
+            CanvasHostedURLResolver.isCapabilityScopedA2UIURL($0) ? $0 : nil
+        }
+    }
+
+    func updateTrustForMainFrameNavigation(to url: URL) {
+        guard let expectedRemoteURL = self.expectedRemoteURL else { return }
+        // Hosted action trust is load-scoped. Once the main frame leaves the
+        // selected A2UI request, page navigation must never re-arm it.
+        if !Self.isExactRemoteSourceURL(url, expectedRemoteURL: expectedRemoteURL) {
+            self.expectedRemoteURL = nil
+        }
+    }
+
+    func isTrustedSourceURL(_ url: URL) -> Bool {
+        Self.isTrustedSourceURL(url, expectedRemoteURL: self.expectedRemoteURL)
+    }
+
+    static func isTrustedSourceURL(_ url: URL, expectedRemoteURL: URL?) -> Bool {
+        if let scheme = url.scheme?.lowercased(), CanvasScheme.allSchemes.contains(scheme) {
+            return true
+        }
+        return self.isExactRemoteSourceURL(url, expectedRemoteURL: expectedRemoteURL)
+    }
+
+    private static func isExactRemoteSourceURL(_ url: URL, expectedRemoteURL: URL?) -> Bool {
+        guard let expectedRemoteURL,
+              CanvasHostedURLResolver.isCapabilityScopedA2UIURL(expectedRemoteURL),
+              let actual = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let expected = URLComponents(url: expectedRemoteURL, resolvingAgainstBaseURL: false),
+              let actualScheme = actual.scheme?.lowercased(),
+              let expectedScheme = expected.scheme?.lowercased(),
+              actualScheme == expectedScheme,
+              actual.host?.lowercased() == expected.host?.lowercased(),
+              self.effectivePort(actual) == self.effectivePort(expected),
+              actual.user == nil,
+              actual.password == nil,
+              expected.user == nil,
+              expected.password == nil
+        else {
+            return false
+        }
+        return actual.percentEncodedPath == expected.percentEncodedPath &&
+            actual.percentEncodedQuery == expected.percentEncodedQuery
+    }
+
     func userContentController(_: WKUserContentController, didReceive message: WKScriptMessage) {
         guard Self.allMessageNames.contains(message.name) else { return }
 
-        // Only accept actions from local Canvas content (not arbitrary web pages).
-        guard let webView = message.webView, let url = webView.url else { return }
-        if let scheme = url.scheme, CanvasScheme.allSchemes.contains(scheme) {
-            // ok
-        } else if Self.isLocalNetworkCanvasURL(url) {
-            // ok
-        } else {
+        // Only the main in-app document or the exact capability-scoped A2UI
+        // document may dispatch. Other web content remains render-only.
+        guard message.frameInfo.isMainFrame else { return }
+        guard let webView = message.webView, let url = message.frameInfo.request.url else { return }
+        guard self.isTrustedSourceURL(url) else {
             return
         }
 
@@ -108,42 +153,13 @@ final class CanvasA2UIActionMessageHandler: NSObject, WKScriptMessageHandler {
         }
     }
 
-    static func isLocalNetworkCanvasURL(_ url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
-            return false
+    private static func effectivePort(_ components: URLComponents) -> Int? {
+        if let port = components.port { return port }
+        return switch components.scheme?.lowercased() {
+        case "http": 80
+        case "https": 443
+        default: nil
         }
-        guard let host = url.host?.trimmingCharacters(in: .whitespacesAndNewlines), !host.isEmpty else {
-            return false
-        }
-        if host == "localhost" { return true }
-        if host.hasSuffix(".local") { return true }
-        if host.hasSuffix(".ts.net") { return true }
-        if host.hasSuffix(".tailscale.net") { return true }
-        if !host.contains("."), !host.contains(":") { return true }
-        if let ipv4 = Self.parseIPv4(host) {
-            return Self.isLocalNetworkIPv4(ipv4)
-        }
-        return false
     }
-
-    static func parseIPv4(_ host: String) -> (UInt8, UInt8, UInt8, UInt8)? {
-        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count == 4 else { return nil }
-        let bytes: [UInt8] = parts.compactMap { UInt8($0) }
-        guard bytes.count == 4 else { return nil }
-        return (bytes[0], bytes[1], bytes[2], bytes[3])
-    }
-
-    static func isLocalNetworkIPv4(_ ip: (UInt8, UInt8, UInt8, UInt8)) -> Bool {
-        let (a, b, _, _) = ip
-        if a == 10 { return true }
-        if a == 172, (16...31).contains(Int(b)) { return true }
-        if a == 192, b == 168 { return true }
-        if a == 127 { return true }
-        if a == 169, b == 254 { return true }
-        if a == 100, (64...127).contains(Int(b)) { return true }
-        return false
-    }
-
     // Formatting helpers live in OpenClawKit (`OpenClawCanvasA2UIAction`).
 }
