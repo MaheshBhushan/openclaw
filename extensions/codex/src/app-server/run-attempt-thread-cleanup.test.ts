@@ -140,6 +140,8 @@ function mockClientRuntimeMethods() {
   return {
     getRuntimeIdentity: getMockRuntimeIdentity,
     getServerVersion: getMockServerVersion,
+    // startCodexAttemptRuntime calls client.getInstanceId(); the real client exposes it.
+    getInstanceId: () => "codex-test-client",
   };
 }
 
