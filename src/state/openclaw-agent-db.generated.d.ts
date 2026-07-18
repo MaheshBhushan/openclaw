@@ -10,6 +10,14 @@ export type Generated<T> =
     ? ColumnType<S, I | undefined, U>
     : ColumnType<T, T | undefined, T>;
 
+export interface AcpParentStreamEvents {
+  created_at: number;
+  event_json: string;
+  run_id: string;
+  seq: number;
+  session_id: string;
+}
+
 export interface AuthProfileState {
   state_json: string;
   state_key: string;
@@ -66,6 +74,23 @@ export interface Conversations {
   peer_id: string;
   thread_id: string | null;
   updated_at: number;
+}
+
+export interface HeartbeatOutcomes {
+  context_claimed_at: number | null;
+  context_run_id: string | null;
+  next_check: string | null;
+  occurred_at: number;
+  outcome: string;
+  priority: string | null;
+  response_reason: string | null;
+  run_session_key: string;
+  session_key: string;
+  summary: string;
+  task_names_json: string | null;
+  updated_at: number;
+  wake_reason: string | null;
+  wake_source: string | null;
 }
 
 export interface MemoryEmbeddingCache {
@@ -261,11 +286,13 @@ export interface TranscriptEvents {
 }
 
 export interface DB {
+  acp_parent_stream_events: AcpParentStreamEvents;
   auth_profile_state: AuthProfileState;
   auth_profile_store: AuthProfileStore;
   cache_entries: CacheEntries;
   conversation_deliveries: ConversationDeliveries;
   conversations: Conversations;
+  heartbeat_outcomes: HeartbeatOutcomes;
   memory_embedding_cache: MemoryEmbeddingCache;
   memory_index_chunks: MemoryIndexChunks;
   memory_index_meta: MemoryIndexMeta;
